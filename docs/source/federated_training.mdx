@@ -1,0 +1,187 @@
+# Federated Training
+
+Federated learning trains one shared policy across data holders that never pool their data. Each
+client trains locally on its own episodes and uploads only a **weight delta**; the server averages
+those deltas into a global model and broadcasts it back. Nothing but weights crosses the boundary.
+
+LeRobot ships this as `lerobot-fl-train`, a drop-in sibling of `lerobot-train`: every existing flag
+(`--dataset.*`, `--policy.*`, `--peft.*`, `--wandb.*`) works the same, plus `--fl.*`,
+`--partition.*` and `--server.*`.
+
+<Tip warning={true}>
+`lerobot-fl-train` runs a **simulated** federation: one process holds the global model and plays
+each client in turn. That is the right tool for developing and ablating the algorithm — clients
+still never see each other's data, and the server still only sees deltas — but it is not a
+deployment across physically separate machines.
+</Tip>
+
+## One round
+
+1. **Broadcast** — the server sends the global trainable weights to the round's clients.
+2. **Local training** — each client runs `--fl.local_steps` optimizer steps on its private shard.
+3. **Upload** — each client returns `local_weights - global_weights`.
+4. **Aggregate** — the server applies the sample-weighted mean of those deltas via `--server.type`.
+
+## Quickstart: SmolVLA on Meta-World MT50
+
+Meta-World's 50 tasks make a natural federation: give each client its own tasks and you get the
+label skew that real deployments have, where no single site has seen the whole problem.
+
+Start with a smoke test — 3 clients, 5 rounds, a few tasks — before committing to a long run:
+
+```bash
+lerobot-fl-train \
+  --dataset.repo_id=lerobot/metaworld_mt50 \
+  --policy.type=smolvla --policy.load_vlm_weights=true \
+  --policy.push_to_hub=false \
+  --partition.strategy=task --partition.num_clients=3 \
+  --fl.rounds=5 --fl.local_steps=10 \
+  --batch_size=4 --num_workers=2 \
+  --output_dir=./outputs/fl-smoke \
+  --fl.save_freq_rounds=5
+```
+
+<Tip warning={true}>
+Use `--policy.type=smolvla`, **not** `--policy.path=lerobot/smolvla_base`. The published base
+checkpoint was fine-tuned for a 3-camera, 6-DoF robot, while Meta-World MT50 has one camera
+(`observation.image`) and 4-DoF state and action. `--policy.path` pins the feature shapes to the
+checkpoint's, so it fails with a feature mismatch. `--policy.type=smolvla` derives the shapes from
+the dataset, and `--policy.load_vlm_weights=true` still loads the pretrained SmolVLM2 backbone —
+only the action expert starts fresh.
+</Tip>
+
+<Tip>
+Every run needs a publish destination or an explicit opt-out, since `push_to_hub` defaults to
+`true`: pass `--policy.push_to_hub=false` to keep everything local, or
+`--policy.repo_id=<your-name>/<model>` to publish the global model when the run finishes.
+Checkpoints are written to `output_dir` either way.
+</Tip>
+
+Then the real run, with partial participation, adaptive server optimization and periodic eval:
+
+```bash
+lerobot-fl-train \
+  --dataset.repo_id=lerobot/metaworld_mt50 \
+  --policy.type=smolvla --policy.load_vlm_weights=true \
+  --env.type=metaworld --env.task=medium \
+  --partition.strategy=task --partition.num_clients=10 \
+  --fl.rounds=400 --fl.local_steps=50 --fl.clients_per_round=3 \
+  --fl.env_eval_freq_rounds=50 \
+  --server.type=fedadam --server.lr=1e-3 \
+  --batch_size=32 --wandb.enable=true --wandb.project=fl-smolvla-mt50 \
+  --policy.push_to_hub=false
+```
+
+The output directory has the same layout as a centralized run, so the global model evaluates with
+the ordinary tooling:
+
+```bash
+lerobot-eval \
+  --policy.path=outputs/train/<run>/checkpoints/last/pretrained_model \
+  --env.type=metaworld --env.task=medium \
+  --eval.batch_size=1 --eval.n_episodes=10
+```
+
+## Partitioning
+
+`--partition.strategy` decides how non-IID the federation is — the single biggest lever on how
+hard the problem is.
+
+| Strategy | What each client gets | Use it for |
+| --- | --- | --- |
+| `uniform` | A random slice of episodes; every client sees every task | The IID sanity check. Federated averaging should nearly match centralized training here — if it doesn't, something is wrong with the setup, not the algorithm. |
+| `dirichlet` | Each task split across clients with `Dir(alpha)` proportions | Sweeping heterogeneity. `--partition.dirichlet_alpha=0.5` is moderately skewed; lower is harsher. |
+| `task` | A disjoint set of tasks (default) | The realistic and hardest case: a client that has never seen `door-open-v3` must still contribute to a global policy that can do it. |
+
+The split is computed once from dataset metadata — no frames are read — and logged as a table so
+you can see exactly what each client holds. `--partition.seed` is separate from `--seed`, so the
+same split can be reused across runs that differ only in model or aggregation.
+
+## Communication cost
+
+Only parameters with `requires_grad` are exchanged, and the run logs the per-round payload up
+front. This is the constraint that decides whether federating a VLA is practical at all:
+
+| Setup | Trainable | Per client, per round |
+| --- | --- | --- |
+| Full SmolVLA | ~450M | ~1.8 GB |
+| `--policy.train_expert_only=true` (the default) | action expert only | a few hundred MB |
+| `--peft.method_type=lora --peft.r=16` | adapters only | single-digit MB |
+
+For any realistic federation, train adapters:
+
+```bash
+lerobot-fl-train ... --peft.method_type=lora --peft.r=16
+```
+
+When adapters are enabled, only they are aggregated and only they are published.
+
+See [Training with PEFT](./peft_training) for the adapter options.
+
+## Aggregation
+
+`--server.type` selects what the server does with the aggregated delta:
+
+- **`fedavg`** (default) — `global += lr * mean_delta`. At `--server.lr=1.0` this is exactly the
+  weighted average of the clients' local weights (McMahan et al., 2017).
+- **`fedavgm`** — adds server momentum (Hsu et al., 2019). Cheap damping for client drift.
+- **`fedadam`** — Adam on the server, treating the aggregate as a gradient (Reddi et al., ICLR
+  2021). The standard fix when task-disjoint shards make plain FedAvg unstable. Start at
+  `--server.lr=1e-3`.
+
+`--fl.prox_mu` adds the FedProx penalty (Li et al., 2020) on the *client* side, penalizing drift
+from the round's starting weights. Try `0.01`–`0.1` when local models diverge faster than the
+server averages them back. It composes with any server optimizer.
+
+`--fl.client_weighting` controls each client's influence: `frames` (default), `episodes`, or
+`uniform`. Frame weighting recovers the centralized objective; uniform weighting gives small
+clients an equal say, which can matter when they hold the only copy of a rare task.
+
+## Reading the logs
+
+Per round you get mean client loss, its **spread across clients**, and the norm of the server
+update:
+
+```
+round 120/400  clients=[2, 5, 9]  loss=0.0412 (+/-0.0089)  |update|=3.2e-02  lr=8.31e-05  41.3s
+```
+
+The spread is the drift signal. If it grows round over round, local models are diverging faster
+than averaging can reconcile them — lower `--fl.local_steps`, raise `--fl.prox_mu`, or switch to
+`--server.type=fedadam`.
+
+## Interpreting results
+
+A federated number means nothing on its own. Run both bounds with the same budget:
+
+- **Ceiling** — centralized `lerobot-train` on the whole dataset.
+- **Floor** — one client training alone (`--partition.num_clients=N --fl.rounds=...` with
+  aggregation effectively disabled, or simply `lerobot-train --dataset.episodes=<shard>`).
+
+Report **per-task success rate**, not just the mean. Federated learning's characteristic failure
+on task-disjoint shards is collapsing on a handful of tasks while the average still looks healthy.
+
+## What the server standardizes
+
+Normalization statistics are resolved once, globally, and shared by every client. This is not a
+convenience — it is a correctness requirement. Stats are baked into each client's
+`NormalizerProcessorStep`, so if two clients normalized state differently, their weights would be
+fitted to different input spaces and averaging them would be meaningless.
+
+In a deployment where the server cannot see the data, replace that step with a round-zero
+statistics exchange: each client reports the stats for its own shard and the server merges them
+with `lerobot.datasets.compute_stats.aggregate_stats`, which combines counts, means and variances
+without any client revealing a sample.
+
+The learning-rate schedule is likewise global, advancing once per **round** rather than per local
+step, so the decay describes the global model's progress rather than restarting with every client.
+
+## Current limitations
+
+- Single process only — no `torchrun`, no FSDP. Multi-GPU would parallelize *clients*, which is
+  not implemented yet.
+- `--resume` is not supported. Restart from a saved global checkpoint with
+  `--policy.path=<checkpoint>/pretrained_model`.
+- `--ema.enable` and `--dataset.streaming` are rejected: an EMA shadow would track one client's
+  local trajectory, and streaming datasets cannot honor per-client episode allowlists.
+- Reward-model training is policy-only for now.

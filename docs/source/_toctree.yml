@@ -25,6 +25,8 @@
     title: Human In the Loop Data Collection
   - local: peft_training
     title: Training with PEFT (e.g., LoRA)
+  - local: federated_training
+    title: Federated Training
   - local: rename_map
     title: Using Rename Map and Empty Cameras
   title: "Tutorials"
