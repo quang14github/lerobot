@@ -136,6 +136,18 @@ def _client_weight(shard: ClientShard, weighting: str) -> float:
     return 1.0
 
 
+def _client_label(shard: ClientShard, max_len: int = 22) -> str:
+    """Short, stable name for a client's data: its task when it holds exactly one, else a count.
+
+    Task strings in a LeRobotDataset are free-text descriptions, so they are truncated to keep
+    the per-round log line readable.
+    """
+    if len(shard.tasks) == 1:
+        task = shard.tasks[0]
+        return task if len(task) <= max_len else task[: max_len - 1] + "\u2026"
+    return f"{len(shard.tasks)} tasks"
+
+
 def _select_clients(shards: list[ClientShard], clients_per_round: int, rng: np.random.Generator) -> list[int]:
     """Sample the round's participants without replacement."""
     if clients_per_round in (0, len(shards)):
@@ -419,16 +431,24 @@ def fl_train(cfg: FederatedTrainPipelineConfig):
                 tracker.samples_per_s = cfg.batch_size / tracker.step_s.avg
             mean_loss = float(np.mean(list(client_losses.values())))
             spread = float(np.std(list(client_losses.values())))
+            # Per-client losses, not just their summary: under a task partition the mean can
+            # look healthy while one client is diverging on its own task, and that is exactly
+            # the failure federated training needs to surface. The task each client holds is
+            # named too, so a struggling client is identifiable without cross-referencing the
+            # partition table printed at startup.
+            per_client = "  ".join(
+                f"c{cid}={client_losses[cid]:.4f}[{_client_label(shards[cid])}]" for cid in selected
+            )
             logging.info(
-                "round %d/%d  clients=%s  loss=%.4f (+/-%.4f)  |update|=%.4e  lr=%.2e  %.1fs",
+                "round %d/%d  loss=%.4f (+/-%.4f)  |update|=%.4e  lr=%.2e  %.1fs\n    clients: %s",
                 rnd,
                 cfg.fl.rounds,
-                selected,
                 mean_loss,
                 spread,
                 update_norm,
                 optimizer.param_groups[0]["lr"],
                 round_s,
+                per_client,
             )
             if wandb_logger:
                 log_dict = tracker.to_dict()
