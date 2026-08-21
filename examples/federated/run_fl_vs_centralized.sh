@@ -23,14 +23,14 @@ set -euo pipefail
 # Configuration
 # ----------------------------------------------------------------------------------------
 DATASET="${DATASET:-lerobot/metaworld_mt50}"
-OUT_ROOT="${OUT_ROOT:-./outputs/fl-study}"
+OUT_ROOT="${OUT_ROOT:-./outputs/fl-study-$(date +%Y%m%d_%H%M%S)}"
 
 # Scenario A uses one task; scenario B uses these three, one per client.
 TASK_A="${TASK_A:-drawer-close-v3}"
 TASKS_B="${TASKS_B:-drawer-close-v3,button-press-v3,door-close-v3}"
 
 NUM_CLIENTS="${NUM_CLIENTS:-3}"
-ROUNDS="${ROUNDS:-5}"
+ROUNDS="${ROUNDS:-2}"
 LOCAL_STEPS="${LOCAL_STEPS:-5}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 NUM_WORKERS="${NUM_WORKERS:-2}"
@@ -42,6 +42,13 @@ PROX_MU="${PROX_MU:-0.0}"
 
 EVAL_EPISODES="${EVAL_EPISODES:-1}"
 SKIP_EVAL="${SKIP_EVAL:-0}"
+
+# MuJoCo rendering backend, used by the eval rollouts (Meta-World renders rgb_array frames).
+#   egl    - GPU-accelerated headless. The default, and what the LeRobot sim docs use.
+#   osmesa - software fallback; no GPU needed, noticeably slower, needs libOSMesa installed.
+#   glfw   - requires an attached display; will fail on a headless box.
+# Exported so the lerobot-eval subprocesses inherit it.
+export MUJOCO_GL="${MUJOCO_GL:-egl}"
 
 # Compute budget. The federation performs ROUNDS x LOCAL_STEPS x NUM_CLIENTS gradient updates
 # in aggregate, so the centralized arm is given the same total to keep the comparison about
