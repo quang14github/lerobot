@@ -217,6 +217,18 @@ def fl_train(cfg: FederatedTrainPipelineConfig):
         format_partition(shards),
     )
 
+    # Downloads are episode-selective, so each client would otherwise trigger its own
+    # `snapshot_download` the first time it is sampled — several stalls scattered through
+    # training, and on a metered or rate-limited link, several chances to fail mid-run. Fetch
+    # the union of every client's episodes once, up front, while nothing else is waiting.
+    all_episodes = sorted({ep for shard in shards for ep in shard.episodes})
+    logging.info("Warming the dataset cache for %d episodes across all clients", len(all_episodes))
+    warm_cfg = copy.copy(cfg)
+    warm_cfg.dataset = copy.copy(cfg.dataset)
+    warm_cfg.dataset.episodes = all_episodes
+    warm_cfg.dataset.exclude_episodes = None
+    make_dataset(warm_cfg)
+
     # --- global model, built once from the full metadata ---------------------------------------
     logging.info("Creating policy")
     policy = make_policy(cfg=cfg.policy, ds_meta=meta, rename_map=cfg.rename_map)

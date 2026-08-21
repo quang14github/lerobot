@@ -128,7 +128,15 @@ class DatasetReader:
         """Attempt to load from local cache. Returns True if data is sufficient."""
         try:
             self.hf_dataset = self._load_hf_dataset()
-        except (FileNotFoundError, NotADirectoryError):
+        except (FileNotFoundError, NotADirectoryError, ValueError):
+            # FileNotFoundError/NotADirectoryError: nothing cached yet.
+            # ValueError: the cache holds parquet files, but none of them contain the requested
+            # episodes, so the episode filter selects zero rows and `Dataset.from_parquet`
+            # raises "Instruction 'train' corresponds to no data!". That is an insufficient
+            # cache, not a corrupt one. Downloads are episode-selective (`_download` passes
+            # `allow_patterns`), so this is the ordinary state whenever two disjoint episode
+            # subsets of the same repo are loaded in turn — which is exactly what federated
+            # training does, one shard per client.
             self.hf_dataset = None
             return False
         if not self._check_cached_episodes_sufficient():
