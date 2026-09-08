@@ -2,9 +2,9 @@
 #
 # Federated vs centralized SmolVLA on Meta-World MT50, under task heterogeneity.
 #
-# Every client holds a DIFFERENT, disjoint task. This is the case federated learning exists
-# for, and the one plain FedAvg struggles with: a client that has never seen `door-close-v3`
-# must still contribute to a global policy that can do it.
+# Every client holds a DIFFERENT, disjoint set of tasks. This is the case federated learning
+# exists for, and the one plain FedAvg struggles with: a client that has never seen
+# `door-close-v3` must still contribute to a global policy that can do it.
 #
 # Both arms train on exactly the same episodes with the same policy, seed and batch size; the
 # centralized arm simply gets the data pooled on one machine, which makes it the ceiling.
@@ -19,7 +19,8 @@
 #   ROUNDS=5 LOCAL_STEPS=10 SKIP_EVAL=1 bash ...                  # fast plumbing check
 #   SERVER_TYPE=fedadam SERVER_LR=1e-3 bash ...                   # adaptive aggregation
 #   PROX_MU=0.05 bash ...                                         # the FedProx penalty
-#   TASKS=reach-v3,window-open-v3,handle-press-side-v3 bash ...    # different tasks
+#   TASKS_PER_CLIENT=1 TASKS=reach-v3,window-open-v3,door-open-v3 bash ...  # one task each
+#   TASKS=<9 comma-separated slugs> bash ...                       # different tasks
 #   SEEDS="1000 2000 3000 4000 5000" bash ...                      # more seeds
 #   BATCH_SIZE=128 NUM_WORKERS=8 bash ...                          # A100 80GB
 #   BATCH_SIZE=8 MIXED_PRECISION=no bash ...                       # small / older GPU
@@ -32,9 +33,17 @@ set -euo pipefail
 DATASET="${DATASET:-lerobot/metaworld_mt50}"
 OUT_ROOT="${OUT_ROOT:-./outputs/fl-study-$(date +%Y%m%d_%H%M%S)}"
 
-# One task per client, so the count here must match NUM_CLIENTS (checked below). Avoid
-# push-v3 and push-back-v3: they share a description string and the resolver rejects them.
-TASKS="${TASKS:-drawer-close-v3,button-press-v3,door-close-v3}"
+# Tasks are dealt out so that each client holds TASKS_PER_CLIENT of them, disjointly - the
+# partition is still fully non-IID, but each client's shard is TASKS_PER_CLIENT times larger.
+#
+# Shard size matters here beyond throughput. With one task per client a shard is ~4k frames, so
+# at BATCH_SIZE=64 a client re-reads its own data every 64 steps and local overfitting starts
+# masquerading as client drift. More tasks per client keeps the heterogeneity while removing
+# that confound. TASKS must hold exactly NUM_CLIENTS x TASKS_PER_CLIENT entries.
+#
+# Avoid push-v3 and push-back-v3: they share a description string and the resolver rejects them.
+TASKS="${TASKS:-button-press-v3,coffee-button-v3,dial-turn-v3,door-close-v3,door-open-v3,drawer-close-v3,drawer-open-v3,handle-press-side-v3,reach-v3}"
+TASKS_PER_CLIENT="${TASKS_PER_CLIENT:-3}"
 
 NUM_CLIENTS="${NUM_CLIENTS:-3}"
 ROUNDS="${ROUNDS:-100}"
@@ -87,7 +96,7 @@ export MUJOCO_GL="${MUJOCO_GL:-egl}"
 # in aggregate, so the centralized arm is given the same total to keep the comparison about
 # *where the data lives* rather than about who got more compute. Set CENTRAL_STEPS yourself to
 # compare on a different basis (e.g. ROUNDS x LOCAL_STEPS to match global progress instead).
-CENTRAL_STEPS="${CENTRAL_STEPS:-$((ROUNDS * LOCAL_STEPS))}"
+CENTRAL_STEPS="${CENTRAL_STEPS:-$((ROUNDS * LOCAL_STEPS * NUM_CLIENTS))}"
 
 FL_TRAIN=(python -m lerobot.scripts.lerobot_fl_train)
 TRAIN=(python -m lerobot.scripts.lerobot_train)
@@ -222,14 +231,15 @@ banner() {
 # Non-IID - every client holds a DIFFERENT task
 # ----------------------------------------------------------------------------------------
 
-banner "Non-IID - $NUM_CLIENTS clients, one task each: $TASKS"
+banner "Non-IID - $NUM_CLIENTS clients x $TASKS_PER_CLIENT disjoint tasks each"
 
-# partition.strategy=task hands each client a disjoint set of tasks, so an uneven count either
-# starves a client or silently gives one of them two tasks. Fail here with the real reason
-# rather than inside the partitioner.
+# partition.strategy=task deals disjoint task groups to the clients, so the task count has to
+# divide evenly. Fail here with the real reason rather than inside the partitioner.
 NUM_TASKS="$(awk -F, '{print NF}' <<< "$TASKS")"
-if [[ "$NUM_TASKS" -ne "$NUM_CLIENTS" ]]; then
-  echo "!! NUM_CLIENTS ($NUM_CLIENTS) must equal the number of entries in TASKS ($NUM_TASKS)"
+EXPECTED_TASKS=$((NUM_CLIENTS * TASKS_PER_CLIENT))
+if [[ "$NUM_TASKS" -ne "$EXPECTED_TASKS" ]]; then
+  echo "!! TASKS has $NUM_TASKS entries, but NUM_CLIENTS ($NUM_CLIENTS) x TASKS_PER_CLIENT"
+  echo "!! ($TASKS_PER_CLIENT) = $EXPECTED_TASKS are needed."
   echo "!! TASKS = $TASKS"
   exit 1
 fi
