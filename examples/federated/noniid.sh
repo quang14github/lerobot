@@ -42,8 +42,8 @@ OUT_ROOT="${OUT_ROOT:-./outputs/fl-study-$(date +%Y%m%d_%H%M%S)}"
 # that confound. TASKS must hold exactly NUM_CLIENTS x TASKS_PER_CLIENT entries.
 #
 # Avoid push-v3 and push-back-v3: they share a description string and the resolver rejects them.
-TASKS="${TASKS:-button-press-v3,coffee-button-v3,dial-turn-v3,door-close-v3,door-open-v3,drawer-close-v3,drawer-open-v3,handle-press-side-v3,reach-v3}"
-TASKS_PER_CLIENT="${TASKS_PER_CLIENT:-3}"
+TASKS="${TASKS:coffee-pull-v3,door-close-v3,drawer-close-v3}"
+TASKS_PER_CLIENT="${TASKS_PER_CLIENT:-1}"
 
 NUM_CLIENTS="${NUM_CLIENTS:-3}"
 ROUNDS="${ROUNDS:-100}"
@@ -55,7 +55,7 @@ BATCH_SIZE="${BATCH_SIZE:-64}"
 # NUM_CLIENTS x NUM_WORKERS - 12 at the defaults. On a scheduler that pins you to
 # --cpus-per-task, size this as (allocated cores / NUM_CLIENTS), not as the node's core count,
 # or the workers oversubscribe and the GPU starves anyway.
-NUM_WORKERS="${NUM_WORKERS:-4}"
+NUM_WORKERS="${NUM_WORKERS:-12}"
 
 # bf16 autocast. Native on A100 and later; roughly halves activation memory and materially
 # raises throughput on a VLM this size. Set to "no" on hardware without bf16 support.
