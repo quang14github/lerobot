@@ -23,6 +23,7 @@
 #   PROX_MU=0.05 bash ...                                         # the FedProx penalty
 #   TASKS_PER_CLIENT=1 TASKS=reach-v3,window-open-v3,door-open-v3 bash ...  # one task each
 #   TASKS=<9 comma-separated slugs> bash ...                       # different tasks
+#   WANDB_PROJECT=fl-noniid bash ...                               # stream to Weights & Biases
 #   SEEDS="1000 2000 3000 4000 5000" bash ...                      # more seeds
 #   BATCH_SIZE=128 NUM_WORKERS=8 bash ...                          # A100 80GB
 #   BATCH_SIZE=8 MIXED_PRECISION=no bash ...                       # small / older GPU
@@ -101,6 +102,19 @@ RUN_LOCAL="${RUN_LOCAL:-1}"
 # federation, and the own-task-only view cannot make it. One eval per local model either way,
 # just over more tasks, so the cost is roughly NUM_CLIENTS x the local eval time.
 LOCAL_EVAL_ALL_TASKS="${LOCAL_EVAL_ALL_TASKS:-1}"
+
+# Weights & Biases. Empty project disables it entirely, which is the default. When set, every
+# training run streams its own curves (the federated arm additionally logs fl/client_loss_std
+# and the per-client losses), and the finished study is uploaded as one extra run holding the
+# results table and the gap-vs-budget curves.
+WANDB_PROJECT="${WANDB_PROJECT:-fedvla}"
+WANDB_ENTITY="${WANDB_ENTITY:-qduongminh3tcd}"
+
+WANDB_ARGS=()
+if [[ -n "$WANDB_PROJECT" ]]; then
+  WANDB_ARGS=(--wandb.enable=true --wandb.project="$WANDB_PROJECT")
+  [[ -n "$WANDB_ENTITY" ]] && WANDB_ARGS+=(--wandb.entity="$WANDB_ENTITY")
+fi
 
 EVAL_EPISODES="${EVAL_EPISODES:-15}"
 SKIP_EVAL="${SKIP_EVAL:-0}"
@@ -391,7 +405,7 @@ run_seed_group() {
     --fl.prox_mu="$PROX_MU" \
     --server.type="$SERVER_TYPE" --server.lr="$SERVER_LR" \
     --batch_size="$BATCH_SIZE" --num_workers="$NUM_WORKERS" --seed="$SEED" \
-    "${MP_ARGS[@]}" \
+    "${MP_ARGS[@]}" "${WANDB_ARGS[@]}" --job_name="fed-b$BUDGET-s$SEED" \
     --output_dir="$FED" \
     2>&1 | tee "$FED.log" | grep -E "^INFO.*(round|Partitioned|client)|^    clients:" || true
   assert_trained "$FED" "federated-b$BUDGET-s$SEED"
@@ -401,7 +415,7 @@ run_seed_group() {
     --dataset.repo_id="$DATASET" --dataset.episodes="$EPS" \
     --steps="$CENTRAL_STEPS" --save_freq="$CENTRAL_STEPS" \
     --batch_size="$BATCH_SIZE" --num_workers="$NUM_WORKERS" --seed="$SEED" \
-    "${MP_ARGS[@]}" \
+    "${MP_ARGS[@]}" "${WANDB_ARGS[@]}" --job_name="cen-b$BUDGET-s$SEED" \
     --output_dir="$CEN" \
     2>&1 | tee "$CEN.log" | grep -E "^INFO.*step" || true
   assert_trained "$CEN" "centralized-b$BUDGET-s$SEED"
@@ -423,7 +437,7 @@ run_seed_group() {
         --dataset.repo_id="$DATASET" --dataset.episodes="$C_EPS" \
         --steps="$LOCAL_ARM_STEPS" --save_freq="$LOCAL_ARM_STEPS" \
         --batch_size="$BATCH_SIZE" --num_workers="$NUM_WORKERS" --seed="$SEED" \
-        "${MP_ARGS[@]}" \
+        "${MP_ARGS[@]}" "${WANDB_ARGS[@]}" --job_name="loc-c$c-b$BUDGET-s$SEED" \
         --output_dir="$LOC" \
         2>&1 | tee "$LOC.log" | grep -E "^INFO.*step" || true
       assert_trained "$LOC" "local-c$c-b$BUDGET-s$SEED"
@@ -593,4 +607,106 @@ How to read this:
     binomial noise alone is large, so a gap under ~1 std is not a result yet - raise
     EVAL_EPISODES or add seeds before believing it.
 EOS
+# The per-run curves live in their own W&B runs; this uploads the STUDY - the thing those runs
+# cannot show individually, because every number here is a comparison across them.
+if [[ -n "$WANDB_PROJECT" ]]; then
+  echo
+  echo "Uploading study results to W&B project '$WANDB_PROJECT'..."
+  python - "$SUMMARY" "$WANDB_PROJECT" "$WANDB_ENTITY" "$LOCAL_STEPS" "$(basename "$OUT_ROOT")" <<'WB_EOF' || echo "!! W&B upload failed (results are still in $SUMMARY)"
+import statistics
+import sys
+from collections import defaultdict
+
+import wandb
+
+summary_path, project, entity, local_steps, run_name = sys.argv[1:6]
+local_steps = int(local_steps)
+
+rows = defaultdict(lambda: defaultdict(list))
+raw = []
+for line in open(summary_path):
+    arm, seed, budget, task, rate = line.rstrip("\n").split("\t")
+    rows[(int(budget), task, arm)][seed].append(rate)
+    raw.append((arm, int(seed), int(budget), task, rate))
+
+budgets = sorted({b for b, _, _ in rows})
+tasks = sorted({t for _, t, _ in rows if t != "__overall__"})
+ARMS = ("local", "federated", "centralized")
+
+
+def values(budget, task, arm):
+    return [
+        float(v[:-1])
+        for per_seed in (rows.get((budget, task, arm)) or {}).values()
+        for v in per_seed
+        if v.endswith("%")
+    ]
+
+
+def overall(budget, arm):
+    direct = rows.get((budget, "__overall__", arm))
+    if direct:
+        return [float(v[0][:-1]) for v in direct.values() if v[0].endswith("%")]
+    seeds = {s for key in rows for s in rows[key]}
+    out = []
+    for seed in sorted(seeds):
+        per_task = [
+            float(v[:-1])
+            for t in tasks
+            for v in (rows.get((budget, t, arm)) or {}).get(seed, [])
+            if v.endswith("%")
+        ]
+        if per_task:
+            out.append(statistics.mean(per_task))
+    return out
+
+
+run = wandb.init(
+    project=project,
+    entity=entity or None,
+    name=f"summary-{run_name}",
+    job_type="study-summary",
+    tags=["summary"],
+)
+
+table = wandb.Table(columns=["arm", "seed", "budget", "task", "pc_success"])
+for arm, seed, budget, task, rate in raw:
+    table.add_data(arm, seed, budget, task, float(rate[:-1]) if rate.endswith("%") else None)
+run.log({"results": table})
+
+# One step per budget, so W&B draws success and both gaps against compute. This is the whole
+# experiment in one chart: whether the federated gap closes as the budget grows or persists.
+for b in budgets:
+    loc, fed, cen = (overall(b, a) for a in ARMS)
+    payload = {"budget_rounds": b, "updates_per_client": b * local_steps}
+    for name, vs in (("local", loc), ("federated", fed), ("centralized", cen)):
+        if vs:
+            payload[f"overall/{name}"] = statistics.mean(vs)
+            if len(vs) > 1:
+                payload[f"overall/{name}_std"] = statistics.stdev(vs)
+    if fed and loc:
+        payload["gap/fed_minus_local"] = statistics.mean(fed) - statistics.mean(loc)
+    if cen and fed:
+        payload["gap/central_minus_fed"] = statistics.mean(cen) - statistics.mean(fed)
+    for task in tasks:
+        tl, tf, tc = (values(b, task, a) for a in ARMS)
+        if tf:
+            payload[f"task/{task}/federated"] = statistics.mean(tf)
+        if tf and tl:
+            payload[f"task/{task}/fed_minus_local"] = statistics.mean(tf) - statistics.mean(tl)
+        if tc and tf:
+            payload[f"task/{task}/central_minus_fed"] = statistics.mean(tc) - statistics.mean(tf)
+    run.log(payload)
+
+# Final-budget numbers as run summary fields, so studies are sortable in the W&B runs table.
+if budgets:
+    last = budgets[-1]
+    for name, vs in zip(ARMS, (overall(last, a) for a in ARMS), strict=True):
+        if vs:
+            run.summary[f"final/{name}"] = statistics.mean(vs)
+run.finish()
+print("uploaded")
+WB_EOF
+fi
+
 echo "Raw logs and checkpoints: $OUT_ROOT"
