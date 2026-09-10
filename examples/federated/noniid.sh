@@ -16,7 +16,9 @@
 #
 # Usage:
 #   bash examples/federated/noniid.sh                             # default budget
-#   ROUNDS=5 LOCAL_STEPS=10 SKIP_EVAL=1 bash ...                  # fast plumbing check
+#   BUDGETS="25 100 400" bash ...                                  # three compute budgets
+#   BUDGETS=100 bash ...                                           # a single budget
+#   BUDGETS="5" LOCAL_STEPS=2 SKIP_EVAL=1 bash ...                 # fast plumbing check
 #   SERVER_TYPE=fedadam SERVER_LR=1e-3 bash ...                   # adaptive aggregation
 #   PROX_MU=0.05 bash ...                                         # the FedProx penalty
 #   TASKS_PER_CLIENT=1 TASKS=reach-v3,window-open-v3,door-open-v3 bash ...  # one task each
@@ -42,11 +44,21 @@ OUT_ROOT="${OUT_ROOT:-./outputs/fl-study-$(date +%Y%m%d_%H%M%S)}"
 # that confound. TASKS must hold exactly NUM_CLIENTS x TASKS_PER_CLIENT entries.
 #
 # Avoid push-v3 and push-back-v3: they share a description string and the resolver rejects them.
-TASKS="${TASKS:coffee-pull-v3,door-close-v3,drawer-close-v3}"
+TASKS="${TASKS:-coffee-pull-v3,door-close-v3,drawer-close-v3}"
 TASKS_PER_CLIENT="${TASKS_PER_CLIENT:-1}"
 
 NUM_CLIENTS="${NUM_CLIENTS:-3}"
-ROUNDS="${ROUNDS:-100}"
+
+# Compute budgets, as federated rounds. Every arm is rebuilt at each budget so the question
+# "does the federated gap close with more compute, or persist?" gets a real answer rather than
+# a single snapshot.
+#
+# These are separate runs, not checkpoints pulled from one long run. A round-100 checkpoint of
+# a 400-round run is NOT the 100-round model: cfg.steps == rounds drives the LR schedule, so
+# the long run is still mid-anneal there and would look artificially weak. Because the budgets
+# are geometric the honest version is barely more expensive - 125+500+2000 updates is 1.3x the
+# 2000-update run on its own.
+BUDGETS="${BUDGETS:-25 100 400}"
 LOCAL_STEPS="${LOCAL_STEPS:-5}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
 
@@ -74,9 +86,21 @@ fi
 SEEDS="${SEEDS:-1000 2000 3000}"
 PARTITION_SEED="${PARTITION_SEED:-42}"
 
+
 SERVER_TYPE="${SERVER_TYPE:-fedavg}"
 SERVER_LR="${SERVER_LR:-1.0}"
 PROX_MU="${PROX_MU:-0.0}"
+
+# Also train one model per client on that client's shard alone, with no aggregation. This is
+# the floor federation has to beat: what each client could already achieve by itself. It costs
+# NUM_CLIENTS extra training runs per seed, so it is the expensive addition here.
+RUN_LOCAL="${RUN_LOCAL:-1}"
+# Evaluate each local model on EVERY task, not only the one it trained on. Its own-task score
+# still feeds the fed-loc comparison; the rest measure what specialisation costs - a local
+# specialist on a task it has never seen. That contrast is the strongest argument FOR
+# federation, and the own-task-only view cannot make it. One eval per local model either way,
+# just over more tasks, so the cost is roughly NUM_CLIENTS x the local eval time.
+LOCAL_EVAL_ALL_TASKS="${LOCAL_EVAL_ALL_TASKS:-1}"
 
 EVAL_EPISODES="${EVAL_EPISODES:-15}"
 SKIP_EVAL="${SKIP_EVAL:-0}"
@@ -92,11 +116,15 @@ export MUJOCO_GL="${MUJOCO_GL:-egl}"
 # so the comparison stays internally valid, but numbers are not comparable across runs with
 # different batch sizes, and the LR preset was tuned at a much smaller one.
 #
-# Compute budget. The federation performs ROUNDS x LOCAL_STEPS x NUM_CLIENTS gradient updates
-# in aggregate, so the centralized arm is given the same total to keep the comparison about
-# *where the data lives* rather than about who got more compute. Set CENTRAL_STEPS yourself to
-# compare on a different basis (e.g. ROUNDS x LOCAL_STEPS to match global progress instead).
-CENTRAL_STEPS="${CENTRAL_STEPS:-$((ROUNDS * LOCAL_STEPS * NUM_CLIENTS))}"
+# How the baselines are sized against a federated budget of R rounds:
+#   local       R x LOCAL_STEPS               - the updates one client performs, so "did joining
+#                                               beat going alone?" is asked at equal per-model
+#                                               progress.
+#   centralized R x LOCAL_STEPS x NUM_CLIENTS - the updates the federation performs in total, so
+#                                               the ceiling is not handicapped on compute.
+# Set MATCH_CENTRAL_TO_CLIENT=1 to size centralized like local instead (equal global progress
+# rather than equal total compute); the two framings answer different questions.
+MATCH_CENTRAL_TO_CLIENT="${MATCH_CENTRAL_TO_CLIENT:-0}"
 
 FL_TRAIN=(python -m lerobot.scripts.lerobot_fl_train)
 TRAIN=(python -m lerobot.scripts.lerobot_train)
@@ -153,6 +181,48 @@ print("[" + ",".join(str(i) for i in sorted(out)) + "]")
 PYEOF
 }
 
+# One client's shard, read back out of the very partition the federated arm uses, so the local
+# arm provably trains on the same episodes that client held. Emits "<episode list>\t<slugs>";
+# the slugs are needed because --env.task takes task names while the partition speaks in the
+# dataset's natural-language descriptions.
+client_shard() {
+  python - "$DATASET" "$1" "$2" "$3" "$4" <<'SHARD_EOF'
+import json
+import sys
+from pathlib import Path
+
+import lerobot.envs
+from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
+from lerobot.federated.config import PartitionConfig
+from lerobot.federated.partition import partition_episodes
+
+dataset, eps_json, num_clients, client_id, seed = (
+    sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+)
+meta = LeRobotDatasetMetadata(dataset)
+shards = partition_episodes(
+    meta,
+    PartitionConfig(strategy="task", num_clients=num_clients, seed=seed),
+    episodes=json.loads(eps_json),
+)
+shard = shards[client_id]
+
+cfg = json.loads((Path(lerobot.envs.__file__).parent / "metaworld_config.json").read_text())
+desc2slug = {}
+for slug, description in cfg["TASK_DESCRIPTIONS"].items():
+    desc2slug.setdefault(description, []).append(slug)
+
+slugs = []
+for description in shard.tasks:
+    matches = desc2slug.get(description, [])
+    if len(matches) != 1:
+        sys.exit(f"description {description!r} maps to {len(matches)} task slugs; cannot target eval")
+    slugs.append(matches[0])
+
+print("[" + ",".join(str(e) for e in shard.episodes) + "]\t" + ",".join(sorted(slugs)))
+SHARD_EOF
+}
+
 # Read the headline success rate out of a finished eval run. The payload is
 # {"overall": {...}} for multi-task evals and {"aggregated": {...}} for single-env ones, so
 # look for pc_success wherever it lives rather than assuming one shape.
@@ -177,7 +247,7 @@ METRIC_EOF
 # respectable average while having collapsed completely on one client's task.
 per_task_rates() {
   local f="$1/eval_info.json"
-  [[ -f "$f" ]] || return
+  [[ -f "$f" ]] || return 0
   python - "$f" <<'PERTASK_EOF' 2>/dev/null || true
 import json, sys
 
@@ -187,6 +257,29 @@ for name, info in sorted((payload.get("per_group") or {}).items()):
     if rate is not None:
         print(f"      {name:32} {rate:5.1f}%  (n={info.get('n_episodes', '?')})")
 PERTASK_EOF
+}
+
+# Split one local model's per-task rates into the task(s) it owns and the ones it never saw,
+# recording them under different arms so the summary can show both without a second eval.
+record_local_rates() {
+  local seed="$1" evaldir="$2" own="$3" out=""
+  [[ -f "$evaldir/eval_info.json" ]] || return 0
+  out="$(
+    python - "$evaldir/eval_info.json" "$own" <<'LOC_EOF' 2>/dev/null || true
+import json
+import sys
+
+payload = json.load(open(sys.argv[1]))
+own = set(sys.argv[2].split(","))
+for name, info in sorted((payload.get("per_group") or {}).items()):
+    rate = info.get("pc_success")
+    if rate is not None:
+        print(f"{'local' if name in own else 'local_offtask'}\t{name}\t{rate:.1f}%")
+LOC_EOF
+  )"
+  while IFS=$'\t' read -r arm task rate; do
+    [[ -n "$task" ]] && record "$arm" "$seed" "$task" "$rate"
+  done <<< "$out"
 }
 
 run_eval() {
@@ -218,7 +311,31 @@ assert_trained() {
   fi
 }
 
-record() { printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$SUMMARY"; }
+record() { printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$BUDGET" "$3" "$4" >> "$SUMMARY"; }
+
+# One row per task per arm per seed, so the summary can average a task over seeds and put the
+# two arms side by side. Without this the per-task numbers exist only in each run's
+# eval_info.json and can only be eyeballed one seed at a time.
+record_per_task() {
+  local arm="$1" seed="$2" evaldir="$3" out=""
+  [[ -f "$evaldir/eval_info.json" ]] || return 0
+  # The heredoc is captured first and the loop reads it afterwards: a heredoc whose command is
+  # piped into a multi-line `while` swallows the loop body as heredoc content.
+  out="$(
+    python - "$evaldir/eval_info.json" <<'PT_EOF' 2>/dev/null || true
+import json, sys
+
+payload = json.load(open(sys.argv[1]))
+for name, info in sorted((payload.get("per_group") or {}).items()):
+    rate = info.get("pc_success")
+    if rate is not None:
+        print(f"{name}\t{rate:.1f}%")
+PT_EOF
+  )"
+  while IFS=$'\t' read -r task rate; do
+    [[ -n "$task" ]] && record "$arm" "$seed" "$task" "$rate"
+  done <<< "$out"
+}
 
 banner() {
   echo
@@ -247,29 +364,39 @@ fi
 EPS="$(episodes_for_tasks "$TASKS")"
 echo "episodes: $(echo "$EPS" | tr -cd ',' | wc -c | awk '{print $1+1}') selected"
 
-echo "seeds: $SEEDS"
+# Everything one (budget, seed) group does: both arms, their evals, and the local models.
+run_seed_group() {
+  local BUDGET="$1" SEED="$2"
 
-for SEED in $SEEDS; do
-  banner "seed $SEED"
-  FED="$OUT_ROOT/federated-s$SEED"
-  CEN="$OUT_ROOT/centralized-s$SEED"
+  local CLIENT_UPDATES=$((BUDGET * LOCAL_STEPS))
+  local LOCAL_ARM_STEPS=$CLIENT_UPDATES
+  local CENTRAL_STEPS
+  if [[ "$MATCH_CENTRAL_TO_CLIENT" == "1" ]]; then
+    CENTRAL_STEPS=$CLIENT_UPDATES
+  else
+    CENTRAL_STEPS=$((CLIENT_UPDATES * NUM_CLIENTS))
+  fi
+
+  banner "budget $BUDGET - seed $SEED"
+  FED="$OUT_ROOT/federated-b$BUDGET-s$SEED"
+  CEN="$OUT_ROOT/centralized-b$BUDGET-s$SEED"
   rm -rf "$FED" "$CEN"
 
-  echo "--> federated (seed $SEED)"
+  echo "--> federated (budget $BUDGET, seed $SEED)"
   "${FL_TRAIN[@]}" "${POLICY_ARGS[@]}" \
     --dataset.repo_id="$DATASET" --dataset.episodes="$EPS" \
     --partition.strategy=task --partition.num_clients="$NUM_CLIENTS" \
     --partition.seed="$PARTITION_SEED" \
-    --fl.rounds="$ROUNDS" --fl.local_steps="$LOCAL_STEPS" \
+    --fl.rounds="$BUDGET" --fl.local_steps="$LOCAL_STEPS" \
     --fl.prox_mu="$PROX_MU" \
     --server.type="$SERVER_TYPE" --server.lr="$SERVER_LR" \
     --batch_size="$BATCH_SIZE" --num_workers="$NUM_WORKERS" --seed="$SEED" \
     "${MP_ARGS[@]}" \
     --output_dir="$FED" \
     2>&1 | tee "$FED.log" | grep -E "^INFO.*(round|Partitioned|client)|^    clients:" || true
-  assert_trained "$FED" "federated-s$SEED"
+  assert_trained "$FED" "federated-b$BUDGET-s$SEED"
 
-  echo "--> centralized (seed $SEED, $CENTRAL_STEPS steps)"
+  echo "--> centralized (budget $BUDGET, seed $SEED, $CENTRAL_STEPS steps)"
   "${TRAIN[@]}" "${POLICY_ARGS[@]}" \
     --dataset.repo_id="$DATASET" --dataset.episodes="$EPS" \
     --steps="$CENTRAL_STEPS" --save_freq="$CENTRAL_STEPS" \
@@ -277,12 +404,49 @@ for SEED in $SEEDS; do
     "${MP_ARGS[@]}" \
     --output_dir="$CEN" \
     2>&1 | tee "$CEN.log" | grep -E "^INFO.*step" || true
-  assert_trained "$CEN" "centralized-s$SEED"
+  assert_trained "$CEN" "centralized-b$BUDGET-s$SEED"
 
-  run_eval "federated-s$SEED"   "$FED" "$TASKS"
-  run_eval "centralized-s$SEED" "$CEN" "$TASKS"
-  record "federated"   "$SEED" "$(success_rate "$FED/eval")"
-  record "centralized" "$SEED" "$(success_rate "$CEN/eval")"
+  run_eval "federated-b$BUDGET-s$SEED"   "$FED" "$TASKS"
+  run_eval "centralized-b$BUDGET-s$SEED" "$CEN" "$TASKS"
+  record "federated"   "$SEED" __overall__ "$(success_rate "$FED/eval")"
+  record "centralized" "$SEED" __overall__ "$(success_rate "$CEN/eval")"
+  record_per_task "federated"   "$SEED" "$FED/eval"
+  record_per_task "centralized" "$SEED" "$CEN/eval"
+
+  if [[ "$RUN_LOCAL" == "1" ]]; then
+    for ((c = 0; c < NUM_CLIENTS; c++)); do
+      IFS=$'\t' read -r C_EPS C_TASKS < <(client_shard "$EPS" "$NUM_CLIENTS" "$c" "$PARTITION_SEED")
+      LOC="$OUT_ROOT/local-c$c-b$BUDGET-s$SEED"
+      rm -rf "$LOC"
+      echo "--> local: client $c alone on $C_TASKS (budget $BUDGET, seed $SEED, $LOCAL_ARM_STEPS steps)"
+      "${TRAIN[@]}" "${POLICY_ARGS[@]}" \
+        --dataset.repo_id="$DATASET" --dataset.episodes="$C_EPS" \
+        --steps="$LOCAL_ARM_STEPS" --save_freq="$LOCAL_ARM_STEPS" \
+        --batch_size="$BATCH_SIZE" --num_workers="$NUM_WORKERS" --seed="$SEED" \
+        "${MP_ARGS[@]}" \
+        --output_dir="$LOC" \
+        2>&1 | tee "$LOC.log" | grep -E "^INFO.*step" || true
+      assert_trained "$LOC" "local-c$c-b$BUDGET-s$SEED"
+      # Own tasks answer "what does this client achieve unaided?"; all tasks additionally
+      # answer "what did specialising cost it elsewhere?".
+      if [[ "$LOCAL_EVAL_ALL_TASKS" == "1" ]]; then
+        run_eval "local-c$c-b$BUDGET-s$SEED" "$LOC" "$TASKS"
+      else
+        run_eval "local-c$c-b$BUDGET-s$SEED" "$LOC" "$C_TASKS"
+      fi
+      record_local_rates "$SEED" "$LOC/eval" "$C_TASKS"
+    done
+  fi
+}
+
+echo "seeds: $SEEDS"
+echo "budgets (rounds): $BUDGETS"
+
+for BUDGET in $BUDGETS; do
+  banner "budget: $BUDGET rounds x $LOCAL_STEPS local steps = $((BUDGET * LOCAL_STEPS)) updates/client"
+  for SEED in $SEEDS; do
+    run_seed_group "$BUDGET" "$SEED"
+  done
 done
 
 # ----------------------------------------------------------------------------------------
@@ -290,31 +454,103 @@ done
 # ----------------------------------------------------------------------------------------
 banner "Results (pc_success over $(wc -w <<< "$SEEDS") seeds)"
 
-python - "$SUMMARY" <<'AGG_EOF'
+python - "$SUMMARY" "$LOCAL_STEPS" <<'AGG_EOF'
 import statistics
 import sys
 from collections import defaultdict
 
-rows = defaultdict(dict)
+# (budget, task, arm) -> {seed: [rate, ...]}. A list, not a scalar: `local_offtask` gets one row
+# per non-owner client per seed, and keying on the seed alone would keep only the last of them.
+rows = defaultdict(lambda: defaultdict(list))
 for line in open(sys.argv[1]):
-    arm, seed, rate = line.rstrip("\n").split("\t")
-    rows[arm][seed] = rate
+    arm, seed, budget, task, rate = line.rstrip("\n").split("\t")
+    rows[(int(budget), task, arm)][seed].append(rate)
 
+local_steps = int(sys.argv[2])
+
+budgets = sorted({b for b, _, _ in rows})
 seeds = sorted({s for per_seed in rows.values() for s in per_seed})
-print(f"{'arm':<14}" + "".join(f"{('seed ' + s):>12}" for s in seeds) + f"{'mean':>10}{'std':>9}")
-for arm in ("federated", "centralized"):
-    if arm not in rows:
-        continue
-    cells, values = [], []
-    for s in seeds:
-        raw = rows[arm].get(s, "n/a")
-        cells.append(f"{raw:>12}")
-        if raw.endswith("%"):
-            values.append(float(raw[:-1]))
-    # A mean over one usable seed is not a mean; say so rather than printing a bare number.
-    summary = f"{statistics.mean(values):>9.1f}%" if values else f"{'n/a':>10}"
-    spread = f"{statistics.stdev(values):>8.1f}%" if len(values) > 1 else f"{'-':>9}"
-    print(f"{arm:<14}" + "".join(cells) + summary + spread)
+tasks = sorted({t for _, t, _ in rows if t != "__overall__"})
+ARMS = ("local", "federated", "centralized")
+has_offtask = any(a == "local_offtask" for _, _, a in rows)
+
+
+def values(budget, task, arm):
+    """Every numeric rate for one cell, over all seeds and all contributing models."""
+    return [
+        float(v[:-1])
+        for per_seed in (rows.get((budget, task, arm)) or {}).values()
+        for v in per_seed
+        if v.endswith("%")
+    ]
+
+
+def overall(budget, arm):
+    """One arm's headline numbers across seeds at a budget.
+
+    federated/centralized are single models and report their own overall. `local` is not one
+    model but NUM_CLIENTS of them, each scored on the task it owns, so there is no overall to
+    read - it is macro-averaged over tasks instead, weighting every task equally.
+    """
+    direct = rows.get((budget, "__overall__", arm))
+    if direct:
+        return [float(v[0][:-1]) for v in direct.values() if v[0].endswith("%")]
+    out = []
+    for seed in seeds:
+        per_task = [
+            float(v[:-1])
+            for t in tasks
+            for v in (rows.get((budget, t, arm)) or {}).get(seed, [])
+            if v.endswith("%")
+        ]
+        if per_task:
+            out.append(statistics.mean(per_task))
+    return out
+
+
+def cell(vs, width=15):
+    if not vs:
+        return f"{'n/a':>{width}}"
+    text = f"{statistics.mean(vs):.1f}%"
+    # A spread over one value is not a spread; leave it off rather than printing +/-0.0.
+    if len(vs) > 1:
+        text += f" +/-{statistics.stdev(vs):.1f}"
+    return f"{text:>{width}}"
+
+
+def delta(a, b, width=10):
+    return f"{statistics.mean(a) - statistics.mean(b):>{width - 1}.1f}%" if a and b else f"{'n/a':>{width}}"
+
+
+print("Overall, by compute budget (mean over seeds):")
+print(f"{'budget':>8}{'updates/cli':>13}" + "".join(f"{a:>15}" for a in ARMS) + f"{'fed-loc':>10}{'cen-fed':>10}")
+for b in budgets:
+    loc, fed, cen = (overall(b, a) for a in ARMS)
+    print(
+        f"{b:>8}{b * local_steps:>13}"
+        + cell(loc) + cell(fed) + cell(cen) + delta(fed, loc) + delta(cen, fed)
+    )
+
+print("\nPer task and budget (gap = centralized - federated):")
+off_head = f"{'local-off':>15}" if has_offtask else ""
+print(
+    f"{'task':<24}{'budget':>8}{'local':>15}{off_head}{'federated':>15}{'centralized':>15}"
+    f"{'fed-loc':>10}{'cen-fed':>10}"
+)
+for task in tasks:
+    for b in budgets:
+        loc, fed, cen = (values(b, task, a) for a in ARMS)
+        off = values(b, task, "local_offtask")
+        off_cell = cell(off) if has_offtask else ""
+        print(
+            f"{task[:23]:<24}{b:>8}{cell(loc)}{off_cell}{cell(fed)}{cell(cen)}"
+            f"{delta(fed, loc)}{delta(cen, fed)}"
+        )
+    print()
+
+if has_offtask:
+    print("  local     = the client that OWNS this task, trained alone on it")
+    print("  local-off = the other clients' local models, which never saw this task")
 AGG_EOF
 
 echo
@@ -332,7 +568,21 @@ cat <<'EOS'
 
 How to read this:
   * Per-task success is the number that matters, not the mean. The characteristic federated
-    failure here is a respectable average hiding one client's task that collapsed entirely.
+    failure here is a respectable average hiding one client's task that collapsed entirely,
+    which is why the per-task table is sorted by gap: the worst-served task reads first.
+  * A large gap on ONE task with small gaps elsewhere is the interesting shape - it means
+    averaging sacrificed a specific client rather than degrading everything evenly.
+  * fed-loc is the question every client actually cares about: did joining the federation beat
+    training alone on my own data? Negative on a task means that client would have been better
+    off keeping its data and skipping the federation entirely - the sharpest possible negative
+    result, and the one worth reporting.
+  * cen-fed is the cost of not pooling. Together the two bracket federation: local <= federated
+    <= centralized is the outcome federation is supposed to deliver, and any inversion is a
+    finding.
+  * local-off is the cost of specialising. A local model is competitive on its own task and
+    near zero elsewhere; federated should be close to local on each task while remaining
+    competent on all of them. The distance between the local and local-off columns is what
+    federation actually buys, and it is the argument the own-task numbers alone cannot make.
   * Compare against the IID control from run_fl_vs_centralized.sh. A gap that appears in BOTH
     is the cost of federation; the extra gap here is the cost of heterogeneity.
   * Watch `fl/client_loss_std` across rounds in the federated log. Under IID it collapses once
