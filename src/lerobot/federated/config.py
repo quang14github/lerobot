@@ -41,6 +41,11 @@ class PartitionConfig:
     seed: int = 42
     # Dirichlet draws that starve a client are retried this many times before giving up.
     max_draw_attempts: int = 20
+    # For strategy="explicit": client index (as a string key) -> the task names it holds. A task
+    # named by one client is exclusive to it; a task named by several is split evenly between
+    # exactly those clients. That one rule expresses asymmetric federations the other strategies
+    # cannot - e.g. two clients sharing one task while a third holds a different one.
+    task_assignment: dict[str, list[str]] | None = None
 
 
 @dataclass

@@ -38,7 +38,7 @@ from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 
 from .config import PartitionConfig
 
-PARTITION_STRATEGIES = ("uniform", "dirichlet", "task")
+PARTITION_STRATEGIES = ("uniform", "dirichlet", "task", "explicit")
 
 
 @dataclass
@@ -126,6 +126,51 @@ def _split_dirichlet(
     return per_client
 
 
+def _split_explicit(
+    indices: list[int],
+    task_of: dict[int, str],
+    num_clients: int,
+    assignment: dict[str, list[str]],
+    rng: np.random.Generator,
+) -> list[list[int]]:
+    """Give each client the tasks it is named for, splitting shared tasks between their holders.
+
+    A task named by one client is exclusive to it; a task named by several is divided evenly
+    among exactly those clients. Episodes stay disjoint either way - clients that "share a task"
+    hold different episodes of it, as they must when the point is that data never moves.
+    """
+    holders: dict[str, list[int]] = {}
+    for client_key, task_names in assignment.items():
+        client_id = int(client_key)
+        if not 0 <= client_id < num_clients:
+            raise ValueError(
+                f"partition.task_assignment names client {client_id}, outside "
+                f"[0, partition.num_clients={num_clients})."
+            )
+        for task in task_names:
+            holders.setdefault(task, []).append(client_id)
+
+    available = {task_of[ep] for ep in indices}
+    unknown = sorted(set(holders) - available)
+    if unknown:
+        raise ValueError(
+            f"partition.task_assignment names task(s) absent from the selected episodes: {unknown}. "
+            f"Available: {sorted(available)[:10]}{'...' if len(available) > 10 else ''}"
+        )
+
+    by_task: dict[str, list[int]] = {}
+    for ep in indices:
+        by_task.setdefault(task_of[ep], []).append(ep)
+
+    per_client: list[list[int]] = [[] for _ in range(num_clients)]
+    for task, client_ids in sorted(holders.items()):
+        eps = np.array(sorted(by_task[task]))
+        rng.shuffle(eps)
+        for client_id, chunk in zip(sorted(client_ids), np.array_split(eps, len(client_ids)), strict=True):
+            per_client[client_id].extend(int(ep) for ep in chunk)
+    return per_client
+
+
 def _split_uniform(indices: list[int], num_clients: int, rng: np.random.Generator) -> list[list[int]]:
     shuffled = rng.permutation(indices)
     return [[int(ep) for ep in chunk] for chunk in np.array_split(shuffled, num_clients)]
@@ -166,7 +211,11 @@ def partition_episodes(
         )
 
     rng = np.random.default_rng(cfg.seed)
-    if cfg.strategy == "task":
+    if cfg.strategy == "explicit":
+        if not cfg.task_assignment:
+            raise ValueError("partition.strategy='explicit' requires partition.task_assignment.")
+        per_client = _split_explicit(indices, task_of, cfg.num_clients, cfg.task_assignment, rng)
+    elif cfg.strategy == "task":
         per_client = _split_by_task(indices, task_of, cfg.num_clients, rng)
     elif cfg.strategy == "uniform":
         per_client = _split_uniform(indices, cfg.num_clients, rng)

@@ -145,3 +145,55 @@ def test_format_partition_lists_every_client():
 
     assert len(table.splitlines()) == 6  # header + one row per client
     assert "task-0-v3" in table
+
+
+def test_explicit_shares_one_task_between_two_clients():
+    """Two clients on the same task, a third on its own - the asymmetric federation.
+
+    "Sharing a task" still means disjoint episodes: data never moves in federated learning, so
+    the shared task is split between its holders rather than duplicated.
+    """
+    meta = make_meta(num_tasks=2, episodes_per_task=50)
+    shards = partition_episodes(
+        meta,
+        PartitionConfig(
+            strategy="explicit",
+            num_clients=3,
+            task_assignment={"0": ["task-0-v3"], "1": ["task-0-v3"], "2": ["task-1-v3"]},
+        ),
+    )
+
+    assert shards[0].tasks == ["task-0-v3"]
+    assert shards[1].tasks == ["task-0-v3"]
+    assert shards[2].tasks == ["task-1-v3"]
+    # The shared task is halved; the solo client keeps all of its own.
+    assert shards[0].num_episodes == 25
+    assert shards[1].num_episodes == 25
+    assert shards[2].num_episodes == 50
+    assert not set(shards[0].episodes) & set(shards[1].episodes)
+    assert all_episodes(shards) == list(range(100))
+
+
+def test_explicit_rejects_an_unknown_task():
+    with pytest.raises(ValueError, match="absent from the selected episodes"):
+        partition_episodes(
+            make_meta(num_tasks=2),
+            PartitionConfig(
+                strategy="explicit", num_clients=2, task_assignment={"0": ["nope-v3"], "1": ["task-0-v3"]}
+            ),
+        )
+
+
+def test_explicit_rejects_a_client_outside_the_range():
+    with pytest.raises(ValueError, match="outside"):
+        partition_episodes(
+            make_meta(num_tasks=2),
+            PartitionConfig(
+                strategy="explicit", num_clients=2, task_assignment={"5": ["task-0-v3"], "1": ["task-1-v3"]}
+            ),
+        )
+
+
+def test_explicit_requires_an_assignment():
+    with pytest.raises(ValueError, match="requires partition.task_assignment"):
+        partition_episodes(make_meta(), PartitionConfig(strategy="explicit", num_clients=2))
