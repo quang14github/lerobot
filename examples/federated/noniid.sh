@@ -24,6 +24,8 @@
 #   TASKS_PER_CLIENT=1 TASKS=reach-v3,window-open-v3,door-open-v3 bash ...  # one task each
 #   TASKS=<9 comma-separated slugs> bash ...                       # different tasks
 #   WANDB_PROJECT=fl-noniid bash ...                               # stream to Weights & Biases
+#   RUN_LOCAL=0 bash ...                                           # skip the expensive arm
+#   RUN_FEDERATED=1 RUN_CENTRALIZED=0 RUN_LOCAL=0 bash ...          # one arm only
 #   SEEDS="1000 2000 3000 4000 5000" bash ...                      # more seeds
 #   BATCH_SIZE=128 NUM_WORKERS=8 bash ...                          # A100 80GB
 #   BATCH_SIZE=8 MIXED_PRECISION=no bash ...                       # small / older GPU
@@ -92,9 +94,16 @@ SERVER_TYPE="${SERVER_TYPE:-fedavg}"
 SERVER_LR="${SERVER_LR:-1.0}"
 PROX_MU="${PROX_MU:-0.0}"
 
-# Also train one model per client on that client's shard alone, with no aggregation. This is
-# the floor federation has to beat: what each client could already achieve by itself. It costs
-# NUM_CLIENTS extra training runs per seed, so it is the expensive addition here.
+# Which arms to run. Turn one off to reuse results you already have, or to get a first answer
+# cheaply - the summary simply omits any arm with no rows, and $SUMMARY is append-only, so runs
+# with different arms enabled can be concatenated and aggregated together afterwards.
+#
+#   federated    the federation itself.
+#   centralized  the same episodes pooled on one machine - the ceiling.
+#   local        one model per client on its own shard, no aggregation - the floor federation
+#                has to beat. The expensive one: NUM_CLIENTS extra training runs per seed.
+RUN_FEDERATED="${RUN_FEDERATED:-1}"
+RUN_CENTRALIZED="${RUN_CENTRALIZED:-1}"
 RUN_LOCAL="${RUN_LOCAL:-1}"
 # Evaluate each local model on EVERY task, not only the one it trained on. Its own-task score
 # still feeds the fed-loc comparison; the rest measure what specialisation costs - a local
@@ -394,38 +403,42 @@ run_seed_group() {
   banner "budget $BUDGET - seed $SEED"
   FED="$OUT_ROOT/federated-b$BUDGET-s$SEED"
   CEN="$OUT_ROOT/centralized-b$BUDGET-s$SEED"
-  rm -rf "$FED" "$CEN"
 
-  echo "--> federated (budget $BUDGET, seed $SEED)"
-  "${FL_TRAIN[@]}" "${POLICY_ARGS[@]}" \
-    --dataset.repo_id="$DATASET" --dataset.episodes="$EPS" \
-    --partition.strategy=task --partition.num_clients="$NUM_CLIENTS" \
-    --partition.seed="$PARTITION_SEED" \
-    --fl.rounds="$BUDGET" --fl.local_steps="$LOCAL_STEPS" \
-    --fl.prox_mu="$PROX_MU" \
-    --server.type="$SERVER_TYPE" --server.lr="$SERVER_LR" \
-    --batch_size="$BATCH_SIZE" --num_workers="$NUM_WORKERS" --seed="$SEED" \
-    "${MP_ARGS[@]}" "${WANDB_ARGS[@]}" --job_name="fed-b$BUDGET-s$SEED" \
-    --output_dir="$FED" \
-    2>&1 | tee "$FED.log" | grep -E "^INFO.*(round|Partitioned|client)|^    clients:" || true
-  assert_trained "$FED" "federated-b$BUDGET-s$SEED"
+  if [[ "$RUN_FEDERATED" == "1" ]]; then
+    rm -rf "$FED"
+    echo "--> federated (budget $BUDGET, seed $SEED)"
+    "${FL_TRAIN[@]}" "${POLICY_ARGS[@]}" \
+      --dataset.repo_id="$DATASET" --dataset.episodes="$EPS" \
+      --partition.strategy=task --partition.num_clients="$NUM_CLIENTS" \
+      --partition.seed="$PARTITION_SEED" \
+      --fl.rounds="$BUDGET" --fl.local_steps="$LOCAL_STEPS" \
+      --fl.prox_mu="$PROX_MU" \
+      --server.type="$SERVER_TYPE" --server.lr="$SERVER_LR" \
+      --batch_size="$BATCH_SIZE" --num_workers="$NUM_WORKERS" --seed="$SEED" \
+      "${MP_ARGS[@]}" "${WANDB_ARGS[@]}" --job_name="fed-b$BUDGET-s$SEED" \
+      --output_dir="$FED" \
+      2>&1 | tee "$FED.log" | grep -E "^INFO.*(round|Partitioned|client)|^    clients:" || true
+    assert_trained "$FED" "federated-b$BUDGET-s$SEED"
+    run_eval "federated-b$BUDGET-s$SEED" "$FED" "$TASKS"
+    record "federated" "$SEED" __overall__ "$(success_rate "$FED/eval")"
+    record_per_task "federated" "$SEED" "$FED/eval"
+  fi
 
-  echo "--> centralized (budget $BUDGET, seed $SEED, $CENTRAL_STEPS steps)"
-  "${TRAIN[@]}" "${POLICY_ARGS[@]}" \
-    --dataset.repo_id="$DATASET" --dataset.episodes="$EPS" \
-    --steps="$CENTRAL_STEPS" --save_freq="$CENTRAL_STEPS" \
-    --batch_size="$BATCH_SIZE" --num_workers="$NUM_WORKERS" --seed="$SEED" \
-    "${MP_ARGS[@]}" "${WANDB_ARGS[@]}" --job_name="cen-b$BUDGET-s$SEED" \
-    --output_dir="$CEN" \
-    2>&1 | tee "$CEN.log" | grep -E "^INFO.*step" || true
-  assert_trained "$CEN" "centralized-b$BUDGET-s$SEED"
-
-  run_eval "federated-b$BUDGET-s$SEED"   "$FED" "$TASKS"
-  run_eval "centralized-b$BUDGET-s$SEED" "$CEN" "$TASKS"
-  record "federated"   "$SEED" __overall__ "$(success_rate "$FED/eval")"
-  record "centralized" "$SEED" __overall__ "$(success_rate "$CEN/eval")"
-  record_per_task "federated"   "$SEED" "$FED/eval"
-  record_per_task "centralized" "$SEED" "$CEN/eval"
+  if [[ "$RUN_CENTRALIZED" == "1" ]]; then
+    rm -rf "$CEN"
+    echo "--> centralized (budget $BUDGET, seed $SEED, $CENTRAL_STEPS steps)"
+    "${TRAIN[@]}" "${POLICY_ARGS[@]}" \
+      --dataset.repo_id="$DATASET" --dataset.episodes="$EPS" \
+      --steps="$CENTRAL_STEPS" --save_freq="$CENTRAL_STEPS" \
+      --batch_size="$BATCH_SIZE" --num_workers="$NUM_WORKERS" --seed="$SEED" \
+      "${MP_ARGS[@]}" "${WANDB_ARGS[@]}" --job_name="cen-b$BUDGET-s$SEED" \
+      --output_dir="$CEN" \
+      2>&1 | tee "$CEN.log" | grep -E "^INFO.*step" || true
+    assert_trained "$CEN" "centralized-b$BUDGET-s$SEED"
+    run_eval "centralized-b$BUDGET-s$SEED" "$CEN" "$TASKS"
+    record "centralized" "$SEED" __overall__ "$(success_rate "$CEN/eval")"
+    record_per_task "centralized" "$SEED" "$CEN/eval"
+  fi
 
   if [[ "$RUN_LOCAL" == "1" ]]; then
     for ((c = 0; c < NUM_CLIENTS; c++)); do
@@ -453,7 +466,14 @@ run_seed_group() {
   fi
 }
 
+if [[ "$RUN_FEDERATED$RUN_CENTRALIZED$RUN_LOCAL" != *1* ]]; then
+  echo "!! all three arms are disabled; nothing to run."
+  echo "!! set at least one of RUN_FEDERATED / RUN_CENTRALIZED / RUN_LOCAL to 1."
+  exit 1
+fi
+
 echo "seeds: $SEEDS"
+echo "arms: federated=$RUN_FEDERATED centralized=$RUN_CENTRALIZED local=$RUN_LOCAL"
 echo "budgets (rounds): $BUDGETS"
 
 for BUDGET in $BUDGETS; do
@@ -710,3 +730,6 @@ WB_EOF
 fi
 
 echo "Raw logs and checkpoints: $OUT_ROOT"
+
+
+
