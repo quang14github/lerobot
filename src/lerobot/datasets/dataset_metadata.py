@@ -47,6 +47,7 @@ from .io_utils import (
     write_tasks,
 )
 from .language import DEFAULT_TOOLS, LANGUAGE_COLUMNS
+from .storage import DEFAULT_STORAGE_FORMAT
 from .utils import (
     DEFAULT_EPISODES_PATH,
     check_version_compatibility,
@@ -78,7 +79,7 @@ class LeRobotDatasetMetadata:
         *,
         repo_type: Literal["dataset", "bucket"] = "dataset",
         token: str | bool | None = None,
-    ):
+    ) -> None:
         """Load or download metadata for an existing LeRobot dataset.
 
         Attempts to load metadata from local disk. If files are missing or
@@ -111,7 +112,7 @@ class LeRobotDatasetMetadata:
 
         self.repo_id = repo_id
         self.repo_type = repo_type
-        self.revision = revision if revision else CODEBASE_VERSION
+        self.revision: str | None = revision if revision else CODEBASE_VERSION
         self._requested_root = Path(root) if root is not None else None
         if self._requested_root is not None:
             self.root = self._requested_root
@@ -119,8 +120,8 @@ class LeRobotDatasetMetadata:
             self.root = HF_LEROBOT_HUB_CACHE / ("buckets--" + self.repo_id.replace("/", "--"))
         else:
             self.root = HF_LEROBOT_HOME / repo_id
-        self._pq_writer = None
-        self.latest_episode = None
+        self._pq_writer: pq.ParquetWriter | None = None
+        self.latest_episode: dict | None = None
         self._metadata_buffer: list[dict] = []
         self._metadata_buffer_size = metadata_buffer_size
         self._finalized = False
@@ -152,7 +153,7 @@ class LeRobotDatasetMetadata:
         if not hasattr(self, "_metadata_buffer") or len(self._metadata_buffer) == 0:
             return
 
-        combined_dict = {}
+        combined_dict: dict[str, list] = {}
         for episode_dict in self._metadata_buffer:
             for key, value in episode_dict.items():
                 if key not in combined_dict:
@@ -344,6 +345,7 @@ class LeRobotDatasetMetadata:
 
         Raises:
             IndexError: If ``ep_index`` is out of range.
+            ValueError: If the dataset stores no videos (no ``video_path`` template).
         """
         if self.episodes is None:
             self.episodes = load_episodes(self.root)
@@ -354,8 +356,16 @@ class LeRobotDatasetMetadata:
         ep = self.episodes[ep_index]
         chunk_idx = ep[f"videos/{vid_key}/chunk_index"]
         file_idx = ep[f"videos/{vid_key}/file_index"]
-        fpath = self.video_path.format(video_key=vid_key, chunk_index=chunk_idx, file_index=file_idx)
+        video_path_template = self.video_path
+        if video_path_template is None:
+            raise ValueError(f"Dataset '{self.repo_id}' has no video_path template: it stores no videos.")
+        fpath = video_path_template.format(video_key=vid_key, chunk_index=chunk_idx, file_index=file_idx)
         return Path(fpath)
+
+    @property
+    def storage_format(self) -> str:
+        """Format holding the underlying data files (``"lerobot"`` by default)."""
+        return self.info.storage_format or DEFAULT_STORAGE_FORMAT
 
     @property
     def data_path(self) -> str:
@@ -701,11 +711,16 @@ class LeRobotDatasetMetadata:
             raise ValueError(f"Video key {video_key} not found in dataset")
 
         video_keys = [video_key] if video_key is not None else self.video_keys
+        if not video_keys:
+            return
+        video_path_template = self.video_path
+        if video_path_template is None:
+            raise ValueError(f"Dataset '{self.repo_id}' has no video_path template: it stores no videos.")
         preserve_set = set(preserve_keys or ())
         for key in video_keys:
             feature = self.info.features[key]
             existing = feature.get("info") or {}
-            video_path = self.root / self.video_path.format(video_key=key, chunk_index=0, file_index=0)
+            video_path = self.root / video_path_template.format(video_key=key, chunk_index=0, file_index=0)
             new_info = get_video_info(video_path, video_encoder=video_encoder)
             # Drop preserved keys so the existing values win on merge.
             new_info = {k: v for k, v in new_info.items() if k not in preserve_set}
