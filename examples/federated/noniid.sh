@@ -432,7 +432,8 @@ TR_EOF
 per_task_rates() {
   local task rate n
   while IFS=$'\t' read -r task rate n; do
-    [[ -n "$task" ]] && printf '      %-32s %6s  (n=%s)\n' "$task" "$rate" "$n"
+    [[ -n "$task" ]] || continue
+    printf '      %-32s %6s  (n=%s)\n' "$task" "$rate" "$n"
   done <<< "$(task_rates "$1")"
 }
 
@@ -488,7 +489,8 @@ record() { printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$BUDGET" "$3" "$4" >> "$SUMM
 record_per_task() {
   local arm="$1" seed="$2" evaldir="$3" task rate
   while IFS=$'\t' read -r task rate _; do
-    [[ -n "$task" ]] && record "$arm" "$seed" "$task" "$rate"
+    [[ -n "$task" ]] || continue
+    record "$arm" "$seed" "$task" "$rate"
   done <<< "$(task_rates "$evaldir")"
 }
 
