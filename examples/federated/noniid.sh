@@ -21,6 +21,7 @@
 #   BUDGETS="5" LOCAL_STEPS=2 SKIP_EVAL=1 bash ...                 # fast plumbing check
 #   SERVER_TYPE=fedadam SERVER_LR=1e-3 bash ...                   # adaptive aggregation
 #   PROX_MU=0.05 bash ...                                         # the FedProx penalty
+#   CLIENT_WEIGHTING=uniform bash ...                              # equal vote per client
 #   TASKS_PER_CLIENT=1 TASKS=reach-v3,window-open-v3,door-open-v3 bash ...  # one task each
 #   TASKS=<9 comma-separated slugs> bash ...                       # different tasks
 #   WANDB_PROJECT=fl-noniid bash ...                               # stream to Weights & Biases
@@ -147,6 +148,12 @@ PARTITION_SEED="${PARTITION_SEED:-42}"
 SERVER_TYPE="${SERVER_TYPE:-fedavg}"
 SERVER_LR="${SERVER_LR:-1.0}"
 PROX_MU="${PROX_MU:-0.0}"
+# How much each client's delta counts in the average:
+#   frames    - by its frame count (FedAvg's sample weighting). Clients with more or longer
+#               demos dominate; LIBERO tasks hold 29-50 demos each, so its shards are uneven.
+#   episodes  - by its episode count.
+#   uniform   - one client, one vote, however much data it holds.
+CLIENT_WEIGHTING="${CLIENT_WEIGHTING:-frames}"
 
 # Which arms to run. Turn one off to reuse results you already have, or to get a first answer
 # cheaply - the summary simply omits any arm with no rows, and $SUMMARY is append-only, so runs
@@ -557,7 +564,7 @@ run_seed_group() {
       --partition.strategy=task --partition.num_clients="$NUM_CLIENTS" \
       --partition.seed="$PARTITION_SEED" \
       --fl.rounds="$BUDGET" --fl.local_steps="$LOCAL_STEPS" \
-      --fl.prox_mu="$PROX_MU" \
+      --fl.prox_mu="$PROX_MU" --fl.client_weighting="$CLIENT_WEIGHTING" \
       --server.type="$SERVER_TYPE" --server.lr="$SERVER_LR" \
       ${FED_ENV_ARGS[@]:+"${FED_ENV_ARGS[@]}" "${ALL_TARGET[@]}"} \
       --batch_size="$BATCH_SIZE" --num_workers="$NUM_WORKERS" --seed="$SEED" \
