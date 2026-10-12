@@ -24,19 +24,66 @@
 #   TASKS_PER_CLIENT=1 TASKS=reach-v3,window-open-v3,door-open-v3 bash ...  # one task each
 #   TASKS=<9 comma-separated slugs> bash ...                       # different tasks
 #   WANDB_PROJECT=fl-noniid bash ...                               # stream to Weights & Biases
+#   ENV_EVAL_EVERY=10 bash ...                                     # rollouts during training
 #   RUN_LOCAL=0 bash ...                                           # skip the expensive arm
 #   RUN_FEDERATED=1 RUN_CENTRALIZED=0 RUN_LOCAL=0 bash ...          # one arm only
 #   SEEDS="1000 2000 3000 4000 5000" bash ...                      # more seeds
 #   BATCH_SIZE=128 NUM_WORKERS=8 bash ...                          # A100 80GB
 #   BATCH_SIZE=8 MIXED_PRECISION=no bash ...                       # small / older GPU
 #
+# LIBERO - separating TASK heterogeneity from ENVIRONMENT heterogeneity:
+#   BENCHMARK=libero SUITE=libero_goal    bash ...   # task difference: one kitchen scene, each
+#                                                    #   client pursues a different goal in it
+#   BENCHMARK=libero SUITE=libero_spatial bash ...   # environment difference (layout): every
+#                                                    #   client does "black bowl -> plate", but
+#                                                    #   in a different scene arrangement
+#   BENCHMARK=libero SUITE=libero_object  bash ...   # environment difference (objects): every
+#                                                    #   client does "<object> -> basket", with a
+#                                                    #   different object
+#   BENCHMARK=libero SUITE=libero_goal TASKS=0,1,2,3,4,5 NUM_CLIENTS=3 TASKS_PER_CLIENT=2 bash ...
+# Under LIBERO, TASKS are task ids (0-9) within SUITE. Keep NUM_CLIENTS, TASKS_PER_CLIENT and the
+# task count identical across the three suites so the only thing that changes is the KIND of
+# heterogeneity. Results are keyed "<suite>_<id>"; the id -> instruction legend is printed at
+# startup.
+#
 set -euo pipefail
 
 # ----------------------------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------------------------
-DATASET="${DATASET:-lerobot/metaworld_mt50}"
-OUT_ROOT="${OUT_ROOT:-./outputs/fl-study-$(date +%Y%m%d_%H%M%S)}"
+# metaworld | libero. Everything downstream - episode lookup, the eval env, per-task result
+# parsing - dispatches on this.
+BENCHMARK="${BENCHMARK:-metaworld}"
+# LIBERO suite. libero_goal is the task-heterogeneity condition; libero_spatial and
+# libero_object are the environment-heterogeneity conditions (layouts and objects respectively).
+SUITE="${SUITE:-libero_goal}"
+
+case "$BENCHMARK" in
+  metaworld)
+    DATASET="${DATASET:-lerobot/metaworld_mt50}"
+    STUDY_TAG="metaworld"
+    JOB_PREFIX=""
+    ;;
+  libero)
+    case "$SUITE" in
+      libero_goal | libero_spatial | libero_object | libero_10) ;;
+      *)
+        echo "!! SUITE=$SUITE is not a LIBERO suite (libero_goal, libero_spatial, libero_object, libero_10)."
+        exit 1
+        ;;
+    esac
+    # Video-encoded and 37x smaller than HuggingFaceVLA/libero; same demonstrations and schema.
+    DATASET="${DATASET:-lerobot/libero}"
+    STUDY_TAG="$SUITE"
+    # Runs from different suites land in the same W&B project, so their names must not collide.
+    JOB_PREFIX="$SUITE-"
+    ;;
+  *)
+    echo "!! BENCHMARK=$BENCHMARK is not supported; use metaworld or libero."
+    exit 1
+    ;;
+esac
+OUT_ROOT="${OUT_ROOT:-./outputs/fl-study-$STUDY_TAG-$(date +%Y%m%d_%H%M%S)}"
 
 # Tasks are dealt out so that each client holds TASKS_PER_CLIENT of them, disjointly - the
 # partition is still fully non-IID, but each client's shard is TASKS_PER_CLIENT times larger.
@@ -46,8 +93,15 @@ OUT_ROOT="${OUT_ROOT:-./outputs/fl-study-$(date +%Y%m%d_%H%M%S)}"
 # masquerading as client drift. More tasks per client keeps the heterogeneity while removing
 # that confound. TASKS must hold exactly NUM_CLIENTS x TASKS_PER_CLIENT entries.
 #
-# Avoid push-v3 and push-back-v3: they share a description string and the resolver rejects them.
-TASKS="${TASKS:-coffee-pull-v3,door-close-v3,drawer-close-v3}"
+# Meta-World: task slugs. Avoid push-v3 and push-back-v3: they share a description string and the
+# resolver rejects them.
+# LIBERO: task ids within SUITE. LIBERO tasks hold 29-50 demos each (failed ones were filtered),
+# so unlike Meta-World the shards are not exactly equal in size.
+if [[ "$BENCHMARK" == "libero" ]]; then
+  TASKS="${TASKS:-0,1,2}"
+else
+  TASKS="${TASKS:-coffee-pull-v3,door-close-v3,drawer-close-v3}"
+fi
 TASKS_PER_CLIENT="${TASKS_PER_CLIENT:-1}"
 
 NUM_CLIENTS="${NUM_CLIENTS:-3}"
@@ -125,13 +179,31 @@ if [[ -n "$WANDB_PROJECT" ]]; then
   [[ -n "$WANDB_ENTITY" ]] && WANDB_ARGS+=(--wandb.entity="$WANDB_ENTITY")
 fi
 
-EVAL_EPISODES="${EVAL_EPISODES:-15}"
-SKIP_EVAL="${SKIP_EVAL:-0}"
+# Roll out in the simulator DURING training, not only on the final checkpoint: every N rounds
+# for the federated arm, every N x LOCAL_STEPS optimizer steps for the others, so all arms are
+# measured at the same intervals of per-model progress. 0 disables it, which is the default.
+#
+# Mostly redundant with BUDGETS, which already measures success against compute - and measures
+# it better, because each budget is a separate run whose LR schedule has fully annealed, while
+# a mid-training rollout catches the model with its LR still high. Worth enabling for a single
+# diagnostic run (to see WHEN a federated arm diverges, not just that it did); expensive to
+# leave on across a 45-run grid, since every rollout is a full episode of simulation.
+ENV_EVAL_EVERY="${ENV_EVAL_EVERY:-0}"
+# Episodes per task for those in-training rollouts. Deliberately smaller than EVAL_EPISODES:
+# these are for the shape of the curve, not for the numbers you report.
+ENV_EVAL_EPISODES="${ENV_EVAL_EPISODES:-5}"
 
-# MuJoCo rendering backend, used by the eval rollouts (Meta-World renders rgb_array frames).
+EVAL_EPISODES="${EVAL_EPISODES:-15}"
+SKIP_EVAL="${SKIP_EVAL:-1}"
+
+# MuJoCo rendering backend, used by the eval rollouts (Meta-World and LIBERO/robosuite both
+# render rgb_array frames).
 #   egl    - GPU-accelerated headless. The default, and what the LeRobot sim docs use.
 #   osmesa - software fallback; no GPU needed, noticeably slower, needs libOSMesa installed.
 #   glfw   - requires an attached display; will fail on a headless box.
+# LIBERO caveat: robosuite overrides every value except osmesa and glx with egl. Where EGL lacks
+# headless device support (WSL2 among them: "Cannot initialize a EGL device display"), use
+# MUJOCO_GL=glx with a display (WSLg provides one), or osmesa.
 # Exported so the lerobot-eval subprocesses inherit it.
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 
@@ -148,6 +220,19 @@ export MUJOCO_GL="${MUJOCO_GL:-egl}"
 # Set MATCH_CENTRAL_TO_CLIENT=1 to size centralized like local instead (equal global progress
 # rather than equal total compute); the two framings answer different questions.
 MATCH_CENTRAL_TO_CLIENT="${MATCH_CENTRAL_TO_CLIENT:-0}"
+
+# In-training rollouts need an environment; without --env.type the frequency flags are inert.
+# The env itself (type + which tasks) comes from env_target at each call site, since every arm
+# rolls out on a different task set.
+ENV_ARGS=()
+FED_ENV_ARGS=()
+if (( ENV_EVAL_EVERY > 0 )); then
+  ENV_ARGS=(
+    --eval.batch_size=1
+    --eval.n_episodes="$ENV_EVAL_EPISODES"
+  )
+  FED_ENV_ARGS=("${ENV_ARGS[@]}" --fl.env_eval_freq_rounds="$ENV_EVAL_EVERY")
+fi
 
 FL_TRAIN=(python -m lerobot.scripts.lerobot_fl_train)
 TRAIN=(python -m lerobot.scripts.lerobot_train)
@@ -167,37 +252,67 @@ SUMMARY="$OUT_ROOT/summary.tsv"
 # Helpers
 # ----------------------------------------------------------------------------------------
 
-# Resolve comma-separated Meta-World slugs to a draccus episode list, e.g. "[900,901,...]".
-#
-# Episode indices are looked up through each task's natural-language description, because a
-# task's position in the dataset does NOT follow its task_id (the two disagree for 23 of the
-# 50 tasks). Every task occupies exactly one contiguous block of 50 episodes.
-episodes_for_tasks() {
-  python - "$1" "$DATASET" <<'PYEOF'
-import json, sys
+# Every task the benchmark offers, as "<key>\t<instruction>" lines. Keys are what the rest of the
+# script speaks - Meta-World slugs, or "<suite>_<id>" for LIBERO - while the dataset only knows
+# the instruction strings, so this table is the one place the two are joined. It lists the WHOLE
+# benchmark, not only the selected tasks, so a selected task whose instruction is shared with an
+# unselected one is still caught.
+write_task_table() {
+  python - "$BENCHMARK" "$SUITE" <<'TT_EOF'
+import contextlib
+import json
+import sys
 from pathlib import Path
 
-from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
+benchmark, suite = sys.argv[1:3]
+if benchmark == "metaworld":
+    import lerobot.envs
 
-slugs = sys.argv[1].split(",")
-import lerobot.envs
-cfg = json.loads((Path(lerobot.envs.__file__).parent / "metaworld_config.json").read_text())
-desc = cfg["TASK_DESCRIPTIONS"]
+    cfg = json.loads((Path(lerobot.envs.__file__).parent / "metaworld_config.json").read_text())
+    table = list(cfg["TASK_DESCRIPTIONS"].items())
+else:
+    # LIBERO prints progress to stdout, which is where this table goes.
+    with contextlib.redirect_stdout(sys.stderr):
+        from libero.libero import benchmark as libero_benchmark
+
+        tasks = libero_benchmark.get_benchmark_dict()[suite]()
+        table = [(f"{suite}_{i}", tasks.get_task(i).language) for i in range(tasks.n_tasks)]
+for key, description in table:
+    print(f"{key}\t{description}")
+TT_EOF
+}
+
+# Resolve comma-separated task keys to a draccus episode list, e.g. "[900,901,...]".
+#
+# Episodes are matched through each task's instruction, because a task's position in the dataset
+# does NOT follow its id: in Meta-World the two disagree for 23 of the 50 tasks, and in LIBERO
+# the episodes of different tasks are interleaved. The key -> instruction legend goes to stderr.
+episodes_for_tasks() {
+  python - "$1" "$DATASET" "$TASK_TABLE" <<'PYEOF'
+import sys
+
+from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
+from lerobot.federated.partition import episode_tasks
+
+keys = sys.argv[1].split(",")
+desc = dict(line.rstrip("\n").split("\t", 1) for line in open(sys.argv[3]))
 
 meta = LeRobotDatasetMetadata(sys.argv[2])
-tasks = [t[0] if t else "" for t in meta.episodes["tasks"]]
+task_of = episode_tasks(meta, list(range(meta.total_episodes)))
 
 out = []
-for slug in slugs:
-    if slug not in desc:
-        sys.exit(f"unknown Meta-World task: {slug!r}")
-    hits = [i for i, t in enumerate(tasks) if t == desc[slug]]
+for key in keys:
+    if key not in desc:
+        sys.exit(f"unknown task {key!r}; known: {', '.join(desc)}")
+    # Meta-World's push-v3 and push-back-v3 share one instruction, so a lookup by instruction
+    # would return both tasks' episodes. Refuse rather than silently doubling the data.
+    twins = [k for k, d in desc.items() if d == desc[key] and k != key]
+    if twins:
+        sys.exit(f"{key!r} shares its instruction with {twins}; their episodes cannot be told apart")
+    hits = [ep for ep, task in task_of.items() if task == desc[key]]
     if not hits:
-        sys.exit(f"no episodes found for {slug!r} in this dataset")
-    # push-v3 and push-back-v3 share one description string, so a lookup by description
-    # returns both blocks. Refuse rather than silently doubling the data.
-    if len(hits) != 50:
-        sys.exit(f"{slug!r} matched {len(hits)} episodes, expected 50 (ambiguous description?)")
+        sys.exit(f"no episodes found for {key!r} ({desc[key]!r}) in this dataset")
+    print(f"  {key:<20} {len(hits):>3} episodes  {desc[key]}", file=sys.stderr)
     out.extend(hits)
 
 print("[" + ",".join(str(i) for i in sorted(out)) + "]")
@@ -205,22 +320,20 @@ PYEOF
 }
 
 # One client's shard, read back out of the very partition the federated arm uses, so the local
-# arm provably trains on the same episodes that client held. Emits "<episode list>\t<slugs>";
-# the slugs are needed because --env.task takes task names while the partition speaks in the
-# dataset's natural-language descriptions.
+# arm provably trains on the same episodes that client held. Emits "<episode list>\t<task keys>";
+# the keys are needed because the eval env takes task names/ids while the partition speaks in
+# the dataset's natural-language instructions.
 client_shard() {
-  python - "$DATASET" "$1" "$2" "$3" "$4" <<'SHARD_EOF'
+  python - "$DATASET" "$1" "$2" "$3" "$4" "$TASK_TABLE" <<'SHARD_EOF'
 import json
 import sys
-from pathlib import Path
 
-import lerobot.envs
 from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 from lerobot.federated.config import PartitionConfig
 from lerobot.federated.partition import partition_episodes
 
-dataset, eps_json, num_clients, client_id, seed = (
-    sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5])
+dataset, eps_json, num_clients, client_id, seed, table = (
+    sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]), sys.argv[6]
 )
 meta = LeRobotDatasetMetadata(dataset)
 shards = partition_episodes(
@@ -230,20 +343,33 @@ shards = partition_episodes(
 )
 shard = shards[client_id]
 
-cfg = json.loads((Path(lerobot.envs.__file__).parent / "metaworld_config.json").read_text())
-desc2slug = {}
-for slug, description in cfg["TASK_DESCRIPTIONS"].items():
-    desc2slug.setdefault(description, []).append(slug)
+desc2key = {}
+for line in open(table):
+    key, description = line.rstrip("\n").split("\t", 1)
+    desc2key.setdefault(description, []).append(key)
 
-slugs = []
+keys = []
 for description in shard.tasks:
-    matches = desc2slug.get(description, [])
+    matches = desc2key.get(description, [])
     if len(matches) != 1:
-        sys.exit(f"description {description!r} maps to {len(matches)} task slugs; cannot target eval")
-    slugs.append(matches[0])
+        sys.exit(f"instruction {description!r} maps to {len(matches)} task keys; cannot target eval")
+    keys.append(matches[0])
 
-print("[" + ",".join(str(e) for e in shard.episodes) + "]\t" + ",".join(sorted(slugs)))
+print("[" + ",".join(str(e) for e in shard.episodes) + "]\t" + ",".join(sorted(keys)))
 SHARD_EOF
+}
+
+# The env flags that roll out exactly the given comma-separated task keys, one flag per line
+# (read them with mapfile). LIBERO evaluates a suite restricted to task ids; Meta-World takes the
+# slugs directly.
+env_target() {
+  if [[ "$BENCHMARK" == "libero" ]]; then
+    local ids
+    ids="$(tr ',' '\n' <<< "$1" | sed "s/^${SUITE}_//" | paste -sd, -)"
+    printf '%s\n' --env.type=libero --env.task="$SUITE" --env.task_ids="[$ids]"
+  else
+    printf '%s\n' --env.type=metaworld --env.task="$1"
+  fi
 }
 
 # Read the headline success rate out of a finished eval run. The payload is
@@ -266,55 +392,68 @@ else:
 METRIC_EOF
 }
 
+# "<task key>\t<rate>%\t<episodes>" for every task in a finished eval. Meta-World evals are
+# launched with one group per slug, so per_group is already per task. LIBERO groups by suite,
+# which would collapse every task into one number, so its per-task rates are rebuilt from
+# per_task and keyed "<suite>_<id>" to match the task keys used everywhere else.
+task_rates() {
+  local f="$1/eval_info.json"
+  [[ -f "$f" ]] || return 0
+  python - "$f" "$BENCHMARK" <<'TR_EOF' 2>/dev/null || true
+import json
+import sys
+
+payload = json.load(open(sys.argv[1]))
+rows = {}
+if sys.argv[2] == "libero":
+    for entry in payload.get("per_task") or []:
+        successes = entry["metrics"].get("successes") or []
+        if successes:
+            key = f"{entry['task_group']}_{entry['task_id']}"
+            rows[key] = (100 * sum(successes) / len(successes), len(successes))
+else:
+    for name, info in (payload.get("per_group") or {}).items():
+        if info.get("pc_success") is not None:
+            rows[name] = (info["pc_success"], info.get("n_episodes", "?"))
+for name, (rate, n) in sorted(rows.items()):
+    print(f"{name}\t{rate:.1f}%\t{n}")
+TR_EOF
+}
+
 # Per-task success, which is what exposes the federated failure mode: a global model can hold a
 # respectable average while having collapsed completely on one client's task.
 per_task_rates() {
-  local f="$1/eval_info.json"
-  [[ -f "$f" ]] || return 0
-  python - "$f" <<'PERTASK_EOF' 2>/dev/null || true
-import json, sys
-
-payload = json.load(open(sys.argv[1]))
-for name, info in sorted((payload.get("per_group") or {}).items()):
-    rate = info.get("pc_success")
-    if rate is not None:
-        print(f"      {name:32} {rate:5.1f}%  (n={info.get('n_episodes', '?')})")
-PERTASK_EOF
+  local task rate n
+  while IFS=$'\t' read -r task rate n; do
+    [[ -n "$task" ]] && printf '      %-32s %6s  (n=%s)\n' "$task" "$rate" "$n"
+  done <<< "$(task_rates "$1")"
 }
 
 # Split one local model's per-task rates into the task(s) it owns and the ones it never saw,
 # recording them under different arms so the summary can show both without a second eval.
 record_local_rates() {
-  local seed="$1" evaldir="$2" own="$3" out=""
-  [[ -f "$evaldir/eval_info.json" ]] || return 0
-  out="$(
-    python - "$evaldir/eval_info.json" "$own" <<'LOC_EOF' 2>/dev/null || true
-import json
-import sys
-
-payload = json.load(open(sys.argv[1]))
-own = set(sys.argv[2].split(","))
-for name, info in sorted((payload.get("per_group") or {}).items()):
-    rate = info.get("pc_success")
-    if rate is not None:
-        print(f"{'local' if name in own else 'local_offtask'}\t{name}\t{rate:.1f}%")
-LOC_EOF
-  )"
-  while IFS=$'\t' read -r arm task rate; do
-    [[ -n "$task" ]] && record "$arm" "$seed" "$task" "$rate"
-  done <<< "$out"
+  local seed="$1" evaldir="$2" own=",$3," task rate
+  while IFS=$'\t' read -r task rate _; do
+    [[ -n "$task" ]] || continue
+    if [[ "$own" == *",$task,"* ]]; then
+      record local "$seed" "$task" "$rate"
+    else
+      record local_offtask "$seed" "$task" "$rate"
+    fi
+  done <<< "$(task_rates "$evaldir")"
 }
 
 run_eval() {
-  local name="$1" ckpt="$2" tasks="$3"
+  local name="$1" ckpt="$2" tasks="$3" target=()
   if [[ "$SKIP_EVAL" == "1" ]]; then
     echo "  [eval skipped]"
     return
   fi
+  mapfile -t target < <(env_target "$tasks")
   echo "  --> evaluating $name on $tasks"
   "${EVAL[@]}" \
     --policy.path="$ckpt/checkpoints/last/pretrained_model" \
-    --env.type=metaworld --env.task="$tasks" \
+    "${target[@]}" \
     --eval.batch_size=1 --eval.n_episodes="$EVAL_EPISODES" \
     --output_dir="$ckpt/eval" \
     > "$ckpt/eval.log" 2>&1 || echo "  !! eval failed, see $ckpt/eval.log"
@@ -340,24 +479,10 @@ record() { printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$BUDGET" "$3" "$4" >> "$SUMM
 # two arms side by side. Without this the per-task numbers exist only in each run's
 # eval_info.json and can only be eyeballed one seed at a time.
 record_per_task() {
-  local arm="$1" seed="$2" evaldir="$3" out=""
-  [[ -f "$evaldir/eval_info.json" ]] || return 0
-  # The heredoc is captured first and the loop reads it afterwards: a heredoc whose command is
-  # piped into a multi-line `while` swallows the loop body as heredoc content.
-  out="$(
-    python - "$evaldir/eval_info.json" <<'PT_EOF' 2>/dev/null || true
-import json, sys
-
-payload = json.load(open(sys.argv[1]))
-for name, info in sorted((payload.get("per_group") or {}).items()):
-    rate = info.get("pc_success")
-    if rate is not None:
-        print(f"{name}\t{rate:.1f}%")
-PT_EOF
-  )"
-  while IFS=$'\t' read -r task rate; do
+  local arm="$1" seed="$2" evaldir="$3" task rate
+  while IFS=$'\t' read -r task rate _; do
     [[ -n "$task" ]] && record "$arm" "$seed" "$task" "$rate"
-  done <<< "$out"
+  done <<< "$(task_rates "$evaldir")"
 }
 
 banner() {
@@ -384,8 +509,28 @@ if [[ "$NUM_TASKS" -ne "$EXPECTED_TASKS" ]]; then
   exit 1
 fi
 
-EPS="$(episodes_for_tasks "$TASKS")"
+if [[ "$BENCHMARK" == "libero" ]]; then
+  # LIBERO asks on stdin for a dataset path the first time it is imported, which would hang (or
+  # die on EOF in) every subprocess below. Declining once writes its default config.
+  if [[ ! -f "${LIBERO_CONFIG_PATH:-$HOME/.libero}/config.yaml" ]]; then
+    echo N | python -c "import libero.libero" > /dev/null
+  fi
+  # TASKS are ids within the suite; everything downstream uses "<suite>_<id>" keys, the same
+  # names the eval results come back under.
+  TASK_KEYS="$(tr ',' '\n' <<< "$TASKS" | sed "s/^/${SUITE}_/" | paste -sd, -)"
+else
+  TASK_KEYS="$TASKS"
+fi
+
+TASK_TABLE="$OUT_ROOT/tasks.tsv"
+write_task_table > "$TASK_TABLE"
+
+echo "tasks ($STUDY_TAG):"
+EPS="$(episodes_for_tasks "$TASK_KEYS")"
 echo "episodes: $(echo "$EPS" | tr -cd ',' | wc -c | awk '{print $1+1}') selected"
+
+# Env flags covering every task, for the arms that roll out on all of them.
+mapfile -t ALL_TARGET < <(env_target "$TASK_KEYS")
 
 # Everything one (budget, seed) group does: both arms, their evals, and the local models.
 run_seed_group() {
@@ -414,12 +559,13 @@ run_seed_group() {
       --fl.rounds="$BUDGET" --fl.local_steps="$LOCAL_STEPS" \
       --fl.prox_mu="$PROX_MU" \
       --server.type="$SERVER_TYPE" --server.lr="$SERVER_LR" \
+      ${FED_ENV_ARGS[@]:+"${FED_ENV_ARGS[@]}" "${ALL_TARGET[@]}"} \
       --batch_size="$BATCH_SIZE" --num_workers="$NUM_WORKERS" --seed="$SEED" \
-      "${MP_ARGS[@]}" "${WANDB_ARGS[@]}" --job_name="fed-b$BUDGET-s$SEED" \
+      "${MP_ARGS[@]}" "${WANDB_ARGS[@]}" --job_name="${JOB_PREFIX}fed-b$BUDGET-s$SEED" \
       --output_dir="$FED" \
       2>&1 | tee "$FED.log" | grep -E "^INFO.*(round|Partitioned|client)|^    clients:" || true
     assert_trained "$FED" "federated-b$BUDGET-s$SEED"
-    run_eval "federated-b$BUDGET-s$SEED" "$FED" "$TASKS"
+    run_eval "federated-b$BUDGET-s$SEED" "$FED" "$TASK_KEYS"
     record "federated" "$SEED" __overall__ "$(success_rate "$FED/eval")"
     record_per_task "federated" "$SEED" "$FED/eval"
   fi
@@ -430,12 +576,13 @@ run_seed_group() {
     "${TRAIN[@]}" "${POLICY_ARGS[@]}" \
       --dataset.repo_id="$DATASET" --dataset.episodes="$EPS" \
       --steps="$CENTRAL_STEPS" --save_freq="$CENTRAL_STEPS" \
+      ${ENV_ARGS[@]:+"${ENV_ARGS[@]}" "${ALL_TARGET[@]}" --env_eval_freq="$((ENV_EVAL_EVERY * LOCAL_STEPS))"} \
       --batch_size="$BATCH_SIZE" --num_workers="$NUM_WORKERS" --seed="$SEED" \
-      "${MP_ARGS[@]}" "${WANDB_ARGS[@]}" --job_name="cen-b$BUDGET-s$SEED" \
+      "${MP_ARGS[@]}" "${WANDB_ARGS[@]}" --job_name="${JOB_PREFIX}cen-b$BUDGET-s$SEED" \
       --output_dir="$CEN" \
       2>&1 | tee "$CEN.log" | grep -E "^INFO.*step" || true
     assert_trained "$CEN" "centralized-b$BUDGET-s$SEED"
-    run_eval "centralized-b$BUDGET-s$SEED" "$CEN" "$TASKS"
+    run_eval "centralized-b$BUDGET-s$SEED" "$CEN" "$TASK_KEYS"
     record "centralized" "$SEED" __overall__ "$(success_rate "$CEN/eval")"
     record_per_task "centralized" "$SEED" "$CEN/eval"
   fi
@@ -443,21 +590,23 @@ run_seed_group() {
   if [[ "$RUN_LOCAL" == "1" ]]; then
     for ((c = 0; c < NUM_CLIENTS; c++)); do
       IFS=$'\t' read -r C_EPS C_TASKS < <(client_shard "$EPS" "$NUM_CLIENTS" "$c" "$PARTITION_SEED")
+      mapfile -t C_TARGET < <(env_target "$C_TASKS")
       LOC="$OUT_ROOT/local-c$c-b$BUDGET-s$SEED"
       rm -rf "$LOC"
       echo "--> local: client $c alone on $C_TASKS (budget $BUDGET, seed $SEED, $LOCAL_ARM_STEPS steps)"
       "${TRAIN[@]}" "${POLICY_ARGS[@]}" \
         --dataset.repo_id="$DATASET" --dataset.episodes="$C_EPS" \
         --steps="$LOCAL_ARM_STEPS" --save_freq="$LOCAL_ARM_STEPS" \
+        ${ENV_ARGS[@]:+"${ENV_ARGS[@]}" "${C_TARGET[@]}" --env_eval_freq="$((ENV_EVAL_EVERY * LOCAL_STEPS))"} \
         --batch_size="$BATCH_SIZE" --num_workers="$NUM_WORKERS" --seed="$SEED" \
-        "${MP_ARGS[@]}" "${WANDB_ARGS[@]}" --job_name="loc-c$c-b$BUDGET-s$SEED" \
+        "${MP_ARGS[@]}" "${WANDB_ARGS[@]}" --job_name="${JOB_PREFIX}loc-c$c-b$BUDGET-s$SEED" \
         --output_dir="$LOC" \
         2>&1 | tee "$LOC.log" | grep -E "^INFO.*step" || true
       assert_trained "$LOC" "local-c$c-b$BUDGET-s$SEED"
       # Own tasks answer "what does this client achieve unaided?"; all tasks additionally
       # answer "what did specialising cost it elsewhere?".
       if [[ "$LOCAL_EVAL_ALL_TASKS" == "1" ]]; then
-        run_eval "local-c$c-b$BUDGET-s$SEED" "$LOC" "$TASKS"
+        run_eval "local-c$c-b$BUDGET-s$SEED" "$LOC" "$TASK_KEYS"
       else
         run_eval "local-c$c-b$BUDGET-s$SEED" "$LOC" "$C_TASKS"
       fi
@@ -588,15 +737,18 @@ if has_offtask:
 AGG_EOF
 
 echo
-echo "Per-task breakdown (per seed):"
-for SEED in $SEEDS; do
-  for arm in federated centralized; do
-    if [[ -f "$OUT_ROOT/$arm-s$SEED/eval/eval_info.json" ]]; then
-      echo "  $arm seed=$SEED"
-      per_task_rates "$OUT_ROOT/$arm-s$SEED/eval"
-    fi
+echo "Per-task breakdown (per budget and seed):"
+for BUDGET in $BUDGETS; do
+  for SEED in $SEEDS; do
+    for arm in federated centralized; do
+      if [[ -f "$OUT_ROOT/$arm-b$BUDGET-s$SEED/eval/eval_info.json" ]]; then
+        echo "  $arm budget=$BUDGET seed=$SEED"
+        per_task_rates "$OUT_ROOT/$arm-b$BUDGET-s$SEED/eval"
+      fi
+    done
   done
 done
+echo "Task legend: $TASK_TABLE"
 
 cat <<'EOS'
 

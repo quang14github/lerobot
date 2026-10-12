@@ -33,6 +33,7 @@ import logging
 from dataclasses import dataclass
 
 import numpy as np
+import pyarrow.parquet as pq
 
 from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 
@@ -67,16 +68,69 @@ def _read_episode_table(
     if meta.episodes is None:
         raise ValueError(f"Dataset {meta.repo_id} has no episode metadata to partition.")
 
-    ep_tasks = meta.episodes["tasks"]
     ep_from = meta.episodes["dataset_from_index"]
     ep_to = meta.episodes["dataset_to_index"]
 
     indices = list(range(meta.total_episodes)) if episodes is None else list(episodes)
-    # An episode may carry several task strings; the first is the canonical one, as used by
-    # the eval_split logic in the dataset factory.
-    task_of = {ep: (ep_tasks[ep][0] if ep_tasks[ep] else "") for ep in indices}
+    task_of = episode_tasks(meta, indices)
     frames_of = {ep: int(ep_to[ep]) - int(ep_from[ep]) for ep in indices}
     return indices, task_of, frames_of
+
+
+def episode_tasks(meta: LeRobotDatasetMetadata, indices: list[int]) -> dict[int, str]:
+    """Map each episode in `indices` to its canonical task string.
+
+    Read from the episode table's `tasks` column when it has one. Some converted datasets
+    (e.g. `lerobot/libero`) omit that column, leaving the task only on the frames themselves;
+    for those, the task of an episode's first frame is read from the data parquet files.
+    """
+    columns = getattr(meta.episodes, "column_names", meta.episodes)
+    if "tasks" in columns:
+        ep_tasks = meta.episodes["tasks"]
+        # An episode may carry several task strings; the first is the canonical one, as used by
+        # the eval_split logic in the dataset factory.
+        return {ep: (ep_tasks[ep][0] if ep_tasks[ep] else "") for ep in indices}
+    return _episode_tasks_from_frames(meta, indices)
+
+
+def _episode_tasks_from_frames(meta: LeRobotDatasetMetadata, indices: list[int]) -> dict[int, str]:
+    """Recover episode tasks from the per-frame `task_index`, fetching only the data files needed.
+
+    Only the two small index columns are read, and only the parquet files holding the requested
+    episodes are downloaded - no videos - so this stays cheap even on large datasets.
+    """
+    chunk_col = meta.episodes["data/chunk_index"]
+    file_col = meta.episodes["data/file_index"]
+    files = sorted(
+        {meta.data_path.format(chunk_index=chunk_col[ep], file_index=file_col[ep]) for ep in indices}
+    )
+    missing = [f for f in files if not (meta.root / f).is_file()]
+    if missing:
+        logging.info(
+            "Episode table of %s has no 'tasks' column; fetching %d data file(s) to read tasks from frames",
+            meta.repo_id,
+            len(missing),
+        )
+        meta._pull_from_repo(allow_patterns=missing)
+
+    task_names = dict(zip(meta.tasks["task_index"].tolist(), meta.tasks.index.tolist(), strict=True))
+    wanted = set(indices)
+    task_of: dict[int, str] = {}
+    for f in files:
+        table = pq.read_table(meta.root / f, columns=["episode_index", "task_index"])
+        ep_col = table.column("episode_index").to_numpy()
+        task_col = table.column("task_index").to_numpy()
+        # Frames are stored in episode order, so the first occurrence is the episode's first frame.
+        for ep, first in zip(*np.unique(ep_col, return_index=True), strict=True):
+            if int(ep) in wanted:
+                task_of[int(ep)] = str(task_names[int(task_col[first])])
+
+    unresolved = sorted(wanted - set(task_of))
+    if unresolved:
+        raise ValueError(
+            f"Could not find frames for episode(s) {unresolved[:10]} of {meta.repo_id} in its data files."
+        )
+    return task_of
 
 
 def _split_by_task(

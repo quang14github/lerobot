@@ -33,7 +33,7 @@ from .aggregate import (
     weighted_mean,
 )
 from .config import FederatedConfig, FederatedTrainPipelineConfig, PartitionConfig, ServerConfig
-from .partition import ClientShard, format_partition, partition_episodes
+from .partition import ClientShard, episode_tasks, format_partition, partition_episodes
 
 __all__ = [
     "ClientShard",
@@ -49,6 +49,7 @@ __all__ = [
     "ServerOptimizer",
     "compute_delta",
     "delta_norm",
+    "episode_tasks",
     "format_partition",
     "get_trainable_state",
     "make_server_optimizer",

@@ -15,10 +15,13 @@
 # limitations under the License.
 """Partitioning is pure metadata arithmetic, so these tests need no dataset on disk."""
 
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from lerobot.federated.config import PartitionConfig
-from lerobot.federated.partition import format_partition, partition_episodes
+from lerobot.federated.partition import episode_tasks, format_partition, partition_episodes
 
 
 class FakeMetadata:
@@ -197,3 +200,68 @@ def test_explicit_rejects_a_client_outside_the_range():
 def test_explicit_requires_an_assignment():
     with pytest.raises(ValueError, match="requires partition.task_assignment"):
         partition_episodes(make_meta(), PartitionConfig(strategy="explicit", num_clients=2))
+
+
+class FramesOnlyMetadata:
+    """Metadata whose episode table has no `tasks` column, like `lerobot/libero`.
+
+    The task survives only as each frame's `task_index`, in data files laid out on disk the way
+    a v3 dataset stores them - including episodes interleaved across tasks and split over files.
+    """
+
+    data_path = "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet"
+
+    def __init__(self, root, task_per_episode: list[int], task_names: list[str], frames: int = 4):
+        self.repo_id = "fake/frames-only"
+        self.root = root
+        self.total_episodes = len(task_per_episode)
+        self.tasks = pd.DataFrame({"task_index": range(len(task_names))}, index=task_names)
+        # Two episodes per file, so the reader has to visit several files.
+        file_of = [ep // 2 for ep in range(self.total_episodes)]
+        boundaries = [i * frames for i in range(self.total_episodes + 1)]
+        self.episodes = {
+            "dataset_from_index": boundaries[:-1],
+            "dataset_to_index": boundaries[1:],
+            "data/chunk_index": [0] * self.total_episodes,
+            "data/file_index": file_of,
+        }
+        for file_index in sorted(set(file_of)):
+            eps = [ep for ep, f in enumerate(file_of) if f == file_index]
+            path = root / self.data_path.format(chunk_index=0, file_index=file_index)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            table = pa.table(
+                {
+                    "episode_index": [ep for ep in eps for _ in range(frames)],
+                    "task_index": [task_per_episode[ep] for ep in eps for _ in range(frames)],
+                }
+            )
+            pq.write_table(table, path)
+
+    def _pull_from_repo(self, **_):
+        raise AssertionError("every data file is already on disk; nothing should be downloaded")
+
+
+def test_episode_tasks_fall_back_to_frame_task_index(tmp_path):
+    names = ["open the drawer", "put the bowl on the stove", "turn on the stove"]
+    meta = FramesOnlyMetadata(tmp_path, task_per_episode=[2, 0, 1, 0, 2, 1], task_names=names)
+
+    assert episode_tasks(meta, [0, 1, 2, 3, 4, 5]) == {
+        0: names[2],
+        1: names[0],
+        2: names[1],
+        3: names[0],
+        4: names[2],
+        5: names[1],
+    }
+
+
+def test_task_partition_works_without_a_tasks_column(tmp_path):
+    """The partitioner must not depend on the optional episode-table `tasks` column."""
+    names = [f"libero task {t}" for t in range(3)]
+    meta = FramesOnlyMetadata(
+        tmp_path, task_per_episode=[t for _ in range(4) for t in range(3)], task_names=names
+    )
+    shards = partition_episodes(meta, PartitionConfig(strategy="task", num_clients=3))
+
+    assert sorted(task for shard in shards for task in shard.tasks) == names
+    assert all(shard.num_episodes == 4 and shard.num_frames == 16 for shard in shards)

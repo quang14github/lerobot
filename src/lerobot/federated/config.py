@@ -131,7 +131,9 @@ class FederatedTrainPipelineConfig(TrainPipelineConfig):
         if self.server.lr <= 0:
             raise ValueError(f"server.lr must be > 0, got {self.server.lr}")
         if self.fl.env_eval_freq_rounds > 0 and self.env is None:
-            raise ValueError("fl.env_eval_freq_rounds > 0 requires an environment (--env.type=metaworld).")
+            raise ValueError(
+                "fl.env_eval_freq_rounds > 0 requires an environment (e.g. --env.type=metaworld or libero)."
+            )
 
         if self.ema.enable:
             raise NotImplementedError(
