@@ -15,10 +15,29 @@
 # limitations under the License.
 import importlib
 import importlib.metadata
+import importlib.util
 import logging
-from typing import Any
+from typing import Any, Literal, overload
 
 from draccus.choice_types import ChoiceRegistry
+
+
+@overload
+def is_package_available(
+    pkg_name: str, import_name: str | None = None, return_version: Literal[False] = False
+) -> bool: ...
+
+
+@overload
+def is_package_available(
+    pkg_name: str, import_name: str | None = None, *, return_version: Literal[True]
+) -> tuple[bool, str]: ...
+
+
+@overload
+def is_package_available(
+    pkg_name: str, import_name: str | None = None, return_version: bool = False
+) -> tuple[bool, str] | bool: ...
 
 
 def is_package_available(
@@ -110,6 +129,7 @@ def require_package(pkg_name: str, extra: str, import_name: str | None = None) -
 # Do NOT define ad-hoc ``is_package_available(...)`` calls in other modules.
 
 # ML / training
+_lancedb_available = is_package_available("lancedb")
 _transformers_available = is_package_available("transformers")
 _peft_available = is_package_available("peft")
 _scipy_available = is_package_available("scipy")
@@ -182,6 +202,7 @@ def make_device_from_device_class(config: ChoiceRegistry) -> Any:
     parts = module_path.split(".")
     parent_module = ".".join(parts[:-1]) if len(parts) > 1 else module_path
     candidates = [
+        module_path,  # the config's own module (single-file plugins)
         parent_module,  # typical: lerobot_teleop_mydevice
         parent_module + "." + device_class_name.lower(),  # typical: lerobot_teleop_mydevice.mydevice
     ]
@@ -192,8 +213,7 @@ def make_device_from_device_class(config: ChoiceRegistry) -> Any:
         candidates.append(".".join(parts[:-1] + [last.replace("config_", "")]))
 
     # de-duplicate while preserving order
-    seen: set[str] = set()
-    candidates = [c for c in candidates if not (c in seen or seen.add(c))]
+    candidates = list(dict.fromkeys(candidates))
 
     tried: list[str] = []
     for candidate in candidates:
@@ -226,7 +246,8 @@ def register_third_party_plugins() -> None:
 
     This function uses `importlib.metadata` to find packages installed in the environment
     (including editable installs) starting with 'lerobot_robot_', 'lerobot_camera_',
-    'lerobot_teleoperator_', 'lerobot_policy_', or 'lerobot_env_' and imports them.
+    'lerobot_teleoperator_', 'lerobot_policy_', 'lerobot_env_' or 'lerobot_strategy_' and
+    imports them.
     """
     prefixes = (
         "lerobot_robot_",
@@ -234,6 +255,7 @@ def register_third_party_plugins() -> None:
         "lerobot_teleoperator_",
         "lerobot_policy_",
         "lerobot_env_",
+        "lerobot_strategy_",
     )
     imported: list[str] = []
     failed: list[str] = []
