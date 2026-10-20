@@ -211,8 +211,9 @@ OUT_ROOT="${OUT_ROOT:-$REPO_ROOT/outputs/trains/${STUDY_ID}_$(date -d "$STARTED"
 STUDY="$(basename "$OUT_ROOT")"
 
 # As soon as an arm finishes training at a budget, its final model is packed into one
-# MODELS_DIR/<run>.tar.gz - a single file to copy off the cluster, written before that run's
-# eval starts. Each archive also carries the eval flags for its tasks, so
+# MODELS_DIR/<study>__<run>.tar.gz - a single file to copy off the cluster, written before that
+# run's eval starts, and named so that archives from different studies never collide. Each archive
+# also carries the eval flags for its tasks and the study's settings, so
 # examples/federated/eval_archive.sh can evaluate it with no further arguments. The folder also
 # gets copies of study.env, tasks.tsv and summary.tsv, so a models folder copied to another machine
 # explains itself. ARCHIVE=0 skips all of it.
@@ -566,20 +567,29 @@ assert_trained() {
   fi
 }
 
-# Pack a finished run's final model into MODELS_ROOT/<study>/<run>.tar.gz. The archive holds
-# pretrained_model/ (everything lerobot-eval needs) plus eval_args.txt, the env flags for the
-# study's tasks and the study's episode count, which eval_archive.sh uses as its defaults. It is
-# written to a .partial name and renamed when complete, so a .tar.gz on disk is never truncated.
-# A failure here only warns: losing an archive should not abort a multi-day study.
+# Pack a finished run's final model into MODELS_DIR/<study>__<run>.tar.gz. The study is in the
+# file name, so archives from different studies never collide, even downloaded into one folder.
+# Inside:
+#   pretrained_model/  everything lerobot-eval needs
+#   eval_args.txt      the env flags for the study's tasks and its episode count, which
+#                      eval_archive.sh uses as its defaults
+#   study.env          the study's settings plus RUN=<run>, so the archive identifies itself
+#                      however it is renamed or moved (eval_archive.sh names its results from it)
+# It is written to a .partial name and renamed when complete, so a .tar.gz on disk is never
+# truncated. A failure here only warns: losing an archive should not abort a multi-day study.
 archive_run() {
-  local dir="$1" out staging
+  local dir="$1" run out staging
   [[ "$ARCHIVE" == "1" ]] || return 0
-  out="$MODELS_DIR/$(basename "$dir").tar.gz"
+  run="$(basename "$dir")"
+  out="$MODELS_DIR/${STUDY}__${run}.tar.gz"
   staging="$(mktemp -d)"
   printf '%s\n' "${ALL_TARGET[@]}" --eval.batch_size=1 --eval.n_episodes="$EVAL_EPISODES" \
     > "$staging/eval_args.txt"
   if mkdir -p "$MODELS_DIR" \
-    && tar -czf "$out.partial" -C "$dir/checkpoints/last" pretrained_model -C "$staging" eval_args.txt \
+    && cp "$OUT_ROOT/study.env" "$staging/study.env" \
+    && printf "RUN='%s'\n" "$run" >> "$staging/study.env" \
+    && tar -czf "$out.partial" -C "$dir/checkpoints/last" pretrained_model \
+      -C "$staging" eval_args.txt study.env \
     && mv "$out.partial" "$out"; then
     echo "  --> archived $(du -h "$out" | cut -f1): $out"
   else

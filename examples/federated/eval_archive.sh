@@ -16,7 +16,7 @@
 # Anything you pass after the archive is forwarded to lerobot-eval and wins over those defaults.
 #
 # Usage:
-#   bash examples/federated/eval_archive.sh outputs/models/<study>/centralized-b500-s1000.tar.gz
+#   bash examples/federated/eval_archive.sh outputs/models/<study>/<study>__centralized-b500-s1000.tar.gz
 #   bash ... <archive> --eval.n_episodes=10                       # fewer episodes per task
 #   bash ... <archive> --env.task_ids=[2]                         # one task only
 #   bash ... <archive> --output_dir=/somewhere/else               # choose where results go
@@ -24,10 +24,15 @@
 #   EVAL_SEEDS="1000 2000 3000 4000 5000" bash ... <archive>      # five runs
 #   MUJOCO_GL=osmesa bash ... <archive>                           # pick the renderer (WSL: glx by default)
 #
-# Results mirror the archive's place under outputs/models:
-#   outputs/models/<study>/<run>.tar.gz  ->  outputs/eval/<study>/<run>/
-#   outputs/models/<run>.tar.gz          ->  outputs/eval/<run>/   (archives with no study folder)
+# Results go to outputs/eval/<study>/<run>/, named after the archive's own identity rather than
+# where it sits, so archives downloaded into any folder - or renamed - land in the right place:
+#   1. the study.env inside the archive (STUDY and RUN), embedded by noniid.sh;
+#   2. otherwise a "<study>__<run>.tar.gz" file name;
+#   3. otherwise the folder holding it (outputs/models/<study>/<run>.tar.gz), or just
+#      outputs/eval/<run>/ for an archive placed directly in outputs/models.
+#   Inside:
 #       eval_args.txt       what produced this eval: archive, seeds, flags
+#       study.env           the training study's settings, when the archive carries them
 #       seed1000/ ...       one lerobot-eval output per seed (eval_info.json, videos/)
 #       summary.tsv         per task and overall: mean, std and every seed's success rate
 # A re-evaluation of the same archive gets its own <run>_<date-time>/ folder instead of mixing
@@ -111,14 +116,29 @@ fi
 if [[ -n "$OUTPUT_DIR" ]]; then
   mkdir -p "$OUTPUT_DIR"
 else
-  # The archive's folder is its study (outputs/models/<study>/<run>.tar.gz), except for archives
-  # placed directly in outputs/models, which have no study level to mirror.
-  ARCHIVE_DIR="$(dirname "$(realpath "$ARCHIVE")")"
-  if [[ "$ARCHIVE_DIR" == "$(realpath -m "$REPO_ROOT/outputs/models")" ]]; then
-    OUTPUT_DIR="$REPO_ROOT/outputs/eval/$(basename "$ARCHIVE" .tar.gz)"
-  else
-    OUTPUT_DIR="$REPO_ROOT/outputs/eval/$(basename "$ARCHIVE_DIR")/$(basename "$ARCHIVE" .tar.gz)"
+  # Name the results after the archive's identity (see the header for the order of precedence).
+  # The values are read with sed rather than by sourcing study.env, so nothing in an archive runs.
+  STUDY=""
+  RUN=""
+  if [[ -f "$WORKDIR/study.env" ]]; then
+    STUDY="$(sed -n "s/^STUDY='\(.*\)'\$/\1/p" "$WORKDIR/study.env")"
+    RUN="$(sed -n "s/^RUN='\(.*\)'\$/\1/p" "$WORKDIR/study.env")"
   fi
+  if [[ -z "$STUDY" || -z "$RUN" ]]; then
+    NAME="$(basename "$ARCHIVE" .tar.gz)"
+    ARCHIVE_DIR="$(dirname "$(realpath "$ARCHIVE")")"
+    if [[ "$NAME" == *__* ]]; then
+      STUDY="${NAME%%__*}"
+      RUN="${NAME#*__}"
+    elif [[ "$ARCHIVE_DIR" == "$(realpath -m "$REPO_ROOT/outputs/models")" ]]; then
+      STUDY=""
+      RUN="$NAME"
+    else
+      STUDY="$(basename "$ARCHIVE_DIR")"
+      RUN="$NAME"
+    fi
+  fi
+  OUTPUT_DIR="$REPO_ROOT/outputs/eval/${STUDY:+$STUDY/}$RUN"
   mkdir -p "$(dirname "$OUTPUT_DIR")"
   # Claim the folder with a plain mkdir, which fails if it already exists, so two eval - even
   # ones started in the same second - can never share a folder.
@@ -142,6 +162,9 @@ fi
   echo "# seeds: $EVAL_SEEDS"
   printf '%s\n' "${DEFAULTS[@]}" "${ARGS[@]}"
 } > "$OUTPUT_DIR/eval_args.txt"
+if [[ -f "$WORKDIR/study.env" ]]; then
+  cp "$WORKDIR/study.env" "$OUTPUT_DIR/study.env"
+fi
 
 echo "--> ${#SEED_LIST[@]} run(s), seeds $EVAL_SEEDS, results in $OUTPUT_DIR"
 echo "--> flags: ${DEFAULTS[*]} ${ARGS[*]}"
