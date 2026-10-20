@@ -29,6 +29,9 @@
 #   RUN_LOCAL=0 bash ...                                           # skip the expensive arm
 #   RUN_FEDERATED=1 RUN_CENTRALIZED=0 RUN_LOCAL=0 bash ...          # one arm only
 #   SEEDS="1000 2000 3000 4000 5000" bash ...                      # more seeds
+#   ARCHIVE=0 bash ...                                             # skip the model .tar.gz files
+#   SAVE_EVERY=100 bash ...                                        # also keep a checkpoint every 100 rounds
+#   TAG=weightablation bash ...                                    # note in the study's folder name
 #   BATCH_SIZE=128 NUM_WORKERS=8 bash ...                          # A100 80GB
 #   BATCH_SIZE=8 MIXED_PRECISION=no bash ...                       # small / older GPU
 #
@@ -62,8 +65,7 @@ SUITE="${SUITE:-libero_goal}"
 case "$BENCHMARK" in
   metaworld)
     DATASET="${DATASET:-lerobot/metaworld_mt50}"
-    STUDY_TAG="metaworld"
-    JOB_PREFIX=""
+    SUITE_SHORT="mw"
     ;;
   libero)
     case "$SUITE" in
@@ -75,16 +77,15 @@ case "$BENCHMARK" in
     esac
     # Video-encoded and 37x smaller than HuggingFaceVLA/libero; same demonstrations and schema.
     DATASET="${DATASET:-lerobot/libero}"
-    STUDY_TAG="$SUITE"
-    # Runs from different suites land in the same W&B project, so their names must not collide.
-    JOB_PREFIX="$SUITE-"
+    # libero_spatial -> spatial; libero_10 is the suite the paper calls LIBERO-Long.
+    SUITE_SHORT="${SUITE#libero_}"
+    if [[ "$SUITE_SHORT" == "10" ]]; then SUITE_SHORT="long"; fi
     ;;
   *)
     echo "!! BENCHMARK=$BENCHMARK is not supported; use metaworld or libero."
     exit 1
     ;;
 esac
-OUT_ROOT="${OUT_ROOT:-./outputs/fl-study-$STUDY_TAG-$(date +%Y%m%d_%H%M%S)}"
 
 # Tasks are dealt out so that each client holds TASKS_PER_CLIENT of them, disjointly - the
 # partition is still fully non-IID, but each client's shard is TASKS_PER_CLIENT times larger.
@@ -119,6 +120,14 @@ NUM_CLIENTS="${NUM_CLIENTS:-3}"
 BUDGETS="${BUDGETS:-25 100 400}"
 LOCAL_STEPS="${LOCAL_STEPS:-5}"
 BATCH_SIZE="${BATCH_SIZE:-64}"
+
+# Intermediate checkpoints, in rounds. 0 (the default) keeps only each run's final model, which is
+# all the study reads: every budget is its own run, and a mid-run checkpoint is taken before the LR
+# has annealed, so it is not the model that budget produces anyway. Each checkpoint is a full
+# copy of the policy plus optimizer state, so at a 1000-round budget the old every-20-rounds
+# default wrote 50 of them per federated run. Set e.g. SAVE_EVERY=100 to watch a run's progress;
+# the local and centralized arms then save at the same points of per-round progress.
+SAVE_EVERY="${SAVE_EVERY:-0}"
 
 # Dataloader workers PER CLIENT. Each client keeps its own dataloader alive across rounds (that
 # is what stops every round replaying the same first batches), so the process count is
@@ -155,6 +164,73 @@ PROX_MU="${PROX_MU:-0.0}"
 #   uniform   - one client, one vote, however much data it holds.
 CLIENT_WEIGHTING="${CLIENT_WEIGHTING:-frames}"
 
+# ----------------------------------------------------------------------------------------
+# Where the study goes, and what it is called
+# ----------------------------------------------------------------------------------------
+# Each study gets one folder, named after the settings that tell studies apart, so outputs/ can
+# be navigated with ls and globs (e.g. `ls -d outputs/trains/spatial_*_uni_*`):
+#
+#   <suite>_<clients>c<tasks per client>t[_t<task ids>]_<aggregation>_<weighting>_ls<local steps>_bs<batch>[_<TAG>]_<date-time>
+#   spatial_3c1t_t012_fedavg_uni_ls5_bs64_20261013-120501
+#   object_3c1t_t012_fedadam1e-3_prox0.05_frm_ls5_bs64_weightablation_20261014-091500
+#
+#   suite        spatial | object | goal | long | mw (Meta-World). First, so ls groups by it.
+#   task ids     LIBERO only: ids are single digits, so t012 is unambiguous. Meta-World slugs
+#                are too long to list - see TASKS in study.env.
+#   aggregation  SERVER_TYPE, + SERVER_LR when it is not 1.0, + _prox<mu> when FedProx is on.
+#   weighting    frm | uni | epi (CLIENT_WEIGHTING).
+#   TAG          optional free text for why you ran it, e.g. TAG=weightablation.
+#
+# Arm, budget and seed are left out: a study holds several of each, and they name the run folders
+# inside it (centralized-b500-s1000). Every setting - including those not in the name - is written
+# to the study's study.env, which is the record to trust; the name is only for finding it.
+#
+# Paths are anchored to the repo, not the current directory, so outputs land in the same place
+# however the script is launched.
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+TAG="${TAG:-}"
+# The name's fields are separated by "_", so the tag may not contain one.
+TAG="${TAG//[^A-Za-z0-9.-]/-}"
+
+STUDY_ID="${SUITE_SHORT}_${NUM_CLIENTS}c${TASKS_PER_CLIENT}t"
+if [[ "$BENCHMARK" == "libero" ]]; then STUDY_ID+="_t${TASKS//,/}"; fi
+STUDY_ID+="_${SERVER_TYPE}"
+if awk -v lr="$SERVER_LR" 'BEGIN { exit (lr + 0 == 1) }'; then STUDY_ID+="$SERVER_LR"; fi
+if awk -v mu="$PROX_MU" 'BEGIN { exit (mu + 0 == 0) }'; then STUDY_ID+="_prox$PROX_MU"; fi
+case "$CLIENT_WEIGHTING" in
+  frames) STUDY_ID+="_frm" ;;
+  uniform) STUDY_ID+="_uni" ;;
+  episodes) STUDY_ID+="_epi" ;;
+  *) STUDY_ID+="_$CLIENT_WEIGHTING" ;;
+esac
+STUDY_ID+="_ls${LOCAL_STEPS}_bs${BATCH_SIZE}${TAG:+_$TAG}"
+
+STARTED="$(date '+%Y-%m-%d %H:%M:%S')"
+# Full training runs: checkpoints, logs, evals, summary.tsv and study.env.
+OUT_ROOT="${OUT_ROOT:-$REPO_ROOT/outputs/trains/${STUDY_ID}_$(date -d "$STARTED" +%Y%m%d-%H%M%S)}"
+STUDY="$(basename "$OUT_ROOT")"
+
+# As soon as an arm finishes training at a budget, its final model is packed into one
+# MODELS_DIR/<run>.tar.gz - a single file to copy off the cluster, written before that run's
+# eval starts. Each archive also carries the eval flags for its tasks, so
+# examples/federated/eval_archive.sh can evaluate it with no further arguments. The folder also
+# gets copies of study.env, tasks.tsv and summary.tsv, so a models folder copied to another machine
+# explains itself. ARCHIVE=0 skips all of it.
+MODELS_ROOT="${MODELS_ROOT:-$REPO_ROOT/outputs/models}"
+MODELS_DIR="$MODELS_ROOT/$STUDY"
+ARCHIVE="${ARCHIVE:-1}"
+
+# W&B run names carry the study's settings too, so a FedAvg and a FedAdam study at the same
+# budget and seed are told apart there as they are on disk.
+JOB_PREFIX="${STUDY_ID}-"
+
+# The code version, so a result can be traced back to the commit that produced it. "-dirty" marks
+# uncommitted changes to tracked files.
+GIT_COMMIT="$(git -C "$REPO_ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+if [[ "$GIT_COMMIT" != "unknown" && -n "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
+  GIT_COMMIT+="-dirty"
+fi
+
 # Which arms to run. Turn one off to reuse results you already have, or to get a first answer
 # cheaply - the summary simply omits any arm with no rows, and $SUMMARY is append-only, so runs
 # with different arms enabled can be concatenated and aggregated together afterwards.
@@ -179,11 +255,16 @@ LOCAL_EVAL_ALL_TASKS="${LOCAL_EVAL_ALL_TASKS:-1}"
 # results table and the gap-vs-budget curves.
 WANDB_PROJECT="${WANDB_PROJECT:-fedvla}"
 WANDB_ENTITY="${WANDB_ENTITY:-qduongminh3tcd}"
+# Upload every saved checkpoint to W&B as a model artifact. Off by default: each one is a full
+# copy of the policy, stored both in the W&B account and in the local ~/.cache/wandb/artifacts.
+# Checkpoints stay on disk under OUT_ROOT either way.
+WANDB_ARTIFACTS="${WANDB_ARTIFACTS:-0}"
 
 WANDB_ARGS=()
 if [[ -n "$WANDB_PROJECT" ]]; then
   WANDB_ARGS=(--wandb.enable=true --wandb.project="$WANDB_PROJECT")
   [[ -n "$WANDB_ENTITY" ]] && WANDB_ARGS+=(--wandb.entity="$WANDB_ENTITY")
+  [[ "$WANDB_ARTIFACTS" == "1" ]] || WANDB_ARGS+=(--wandb.disable_artifact=true)
 fi
 
 # Roll out in the simulator DURING training, not only on the final checkpoint: every N rounds
@@ -210,9 +291,13 @@ SKIP_EVAL="${SKIP_EVAL:-1}"
 #   glfw   - requires an attached display; will fail on a headless box.
 # LIBERO caveat: robosuite overrides every value except osmesa and glx with egl. Where EGL lacks
 # headless device support (WSL2 among them: "Cannot initialize a EGL device display"), use
-# MUJOCO_GL=glx with a display (WSLg provides one), or osmesa.
+# MUJOCO_GL=glx with a display (WSLg provides one), or osmesa. Under WSL that is the default.
 # Exported so the lerobot-eval subprocesses inherit it.
-export MUJOCO_GL="${MUJOCO_GL:-egl}"
+if [[ -z "${MUJOCO_GL:-}" ]] && grep -qi microsoft /proc/version 2>/dev/null; then
+  export MUJOCO_GL=glx
+else
+  export MUJOCO_GL="${MUJOCO_GL:-egl}"
+fi
 
 # NOTE: BATCH_SIZE is an experimental variable, not only a throughput knob. Both arms share it
 # so the comparison stays internally valid, but numbers are not comparable across runs with
@@ -481,6 +566,61 @@ assert_trained() {
   fi
 }
 
+# Pack a finished run's final model into MODELS_ROOT/<study>/<run>.tar.gz. The archive holds
+# pretrained_model/ (everything lerobot-eval needs) plus eval_args.txt, the env flags for the
+# study's tasks and the study's episode count, which eval_archive.sh uses as its defaults. It is
+# written to a .partial name and renamed when complete, so a .tar.gz on disk is never truncated.
+# A failure here only warns: losing an archive should not abort a multi-day study.
+archive_run() {
+  local dir="$1" out staging
+  [[ "$ARCHIVE" == "1" ]] || return 0
+  out="$MODELS_DIR/$(basename "$dir").tar.gz"
+  staging="$(mktemp -d)"
+  printf '%s\n' "${ALL_TARGET[@]}" --eval.batch_size=1 --eval.n_episodes="$EVAL_EPISODES" \
+    > "$staging/eval_args.txt"
+  if mkdir -p "$MODELS_DIR" \
+    && tar -czf "$out.partial" -C "$dir/checkpoints/last" pretrained_model -C "$staging" eval_args.txt \
+    && mv "$out.partial" "$out"; then
+    echo "  --> archived $(du -h "$out" | cut -f1): $out"
+  else
+    rm -f "$out.partial"
+    echo "  !! could not archive $dir (the checkpoint itself is untouched)"
+  fi
+  rm -rf "$staging"
+}
+
+# Record every setting of this study in OUT_ROOT/study.env, one KEY=value per line, so a folder
+# can be identified (and the study re-launched: `set -a; source study.env; set +a; bash ...`)
+# without trusting its name. FINISHED is appended only when the whole study completes, so a
+# study.env without it marks a study that crashed or is still running.
+write_study_env() {
+  local var val
+  {
+    echo "# Settings of study $STUDY, written by examples/federated/noniid.sh"
+    for var in STUDY STARTED GIT_COMMIT \
+      BENCHMARK SUITE DATASET TASKS TASK_KEYS NUM_CLIENTS TASKS_PER_CLIENT PARTITION_SEED \
+      BUDGETS SEEDS LOCAL_STEPS BATCH_SIZE SAVE_EVERY NUM_WORKERS MIXED_PRECISION \
+      SERVER_TYPE SERVER_LR PROX_MU CLIENT_WEIGHTING \
+      RUN_FEDERATED RUN_CENTRALIZED RUN_LOCAL LOCAL_EVAL_ALL_TASKS MATCH_CENTRAL_TO_CLIENT \
+      EVAL_EPISODES SKIP_EVAL ENV_EVAL_EVERY ENV_EVAL_EPISODES MUJOCO_GL \
+      WANDB_PROJECT WANDB_ENTITY WANDB_ARTIFACTS ARCHIVE TAG OUT_ROOT MODELS_DIR HOSTNAME; do
+      # Single-quoted so the file reads plainly and still sources; an embedded ' becomes '\''.
+      val="${!var}"
+      printf "%s='%s'\n" "$var" "${val//\'/\'\\\'\'}"
+    done
+  } > "$OUT_ROOT/study.env"
+}
+
+# Mirror the study's small text files next to its archives: settings, task legend and results so
+# far. Called at the start, after every (budget, seed) group and at the end, so the models folder
+# is never far behind even if the study dies midway.
+sync_study_files() {
+  [[ "$ARCHIVE" == "1" ]] || return 0
+  if ! { mkdir -p "$MODELS_DIR" && cp "$OUT_ROOT/study.env" "$TASK_TABLE" "$SUMMARY" "$MODELS_DIR/"; }; then
+    echo "  !! could not copy the study files to $MODELS_DIR"
+  fi
+}
+
 record() { printf '%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$BUDGET" "$3" "$4" >> "$SUMMARY"; }
 
 # One row per task per arm per seed, so the summary can average a task over seeds and put the
@@ -534,12 +674,15 @@ fi
 TASK_TABLE="$OUT_ROOT/tasks.tsv"
 write_task_table > "$TASK_TABLE"
 
-echo "tasks ($STUDY_TAG):"
+echo "tasks ($SUITE_SHORT):"
 EPS="$(episodes_for_tasks "$TASK_KEYS")"
 echo "episodes: $(echo "$EPS" | tr -cd ',' | wc -c | awk '{print $1+1}') selected"
 
 # Env flags covering every task, for the arms that roll out on all of them.
 mapfile -t ALL_TARGET < <(env_target "$TASK_KEYS")
+
+write_study_env
+sync_study_files
 
 # Everything one (budget, seed) group does: both arms, their evals, and the local models.
 run_seed_group() {
@@ -553,6 +696,10 @@ run_seed_group() {
   else
     CENTRAL_STEPS=$((CLIENT_UPDATES * NUM_CLIENTS))
   fi
+  # SAVE_EVERY is in rounds; each arm converts it with its own steps per round (0 stays 0, which
+  # every trainer reads as "final checkpoint only").
+  local LOCAL_SAVE_FREQ=$((SAVE_EVERY * LOCAL_ARM_STEPS / BUDGET))
+  local CENTRAL_SAVE_FREQ=$((SAVE_EVERY * CENTRAL_STEPS / BUDGET))
 
   banner "budget $BUDGET - seed $SEED"
   FED="$OUT_ROOT/federated-b$BUDGET-s$SEED"
@@ -565,7 +712,7 @@ run_seed_group() {
       --dataset.repo_id="$DATASET" --dataset.episodes="$EPS" \
       --partition.strategy=task --partition.num_clients="$NUM_CLIENTS" \
       --partition.seed="$PARTITION_SEED" \
-      --fl.rounds="$BUDGET" --fl.local_steps="$LOCAL_STEPS" \
+      --fl.rounds="$BUDGET" --fl.local_steps="$LOCAL_STEPS" --fl.save_freq_rounds="$SAVE_EVERY" \
       --fl.prox_mu="$PROX_MU" --fl.client_weighting="$CLIENT_WEIGHTING" \
       --server.type="$SERVER_TYPE" --server.lr="$SERVER_LR" \
       ${FED_ENV_ARGS[@]:+"${FED_ENV_ARGS[@]}" "${ALL_TARGET[@]}"} \
@@ -574,6 +721,7 @@ run_seed_group() {
       --output_dir="$FED" \
       2>&1 | tee "$FED.log" | grep -E "^INFO.*(round|Partitioned|client)|^    clients:" || true
     assert_trained "$FED" "federated-b$BUDGET-s$SEED"
+    archive_run "$FED"
     run_eval "federated-b$BUDGET-s$SEED" "$FED" "$TASK_KEYS"
     record "federated" "$SEED" __overall__ "$(success_rate "$FED/eval")"
     record_per_task "federated" "$SEED" "$FED/eval"
@@ -584,13 +732,14 @@ run_seed_group() {
     echo "--> centralized (budget $BUDGET, seed $SEED, $CENTRAL_STEPS steps)"
     "${TRAIN[@]}" "${POLICY_ARGS[@]}" \
       --dataset.repo_id="$DATASET" --dataset.episodes="$EPS" \
-      --steps="$CENTRAL_STEPS" --save_freq="$CENTRAL_STEPS" \
+      --steps="$CENTRAL_STEPS" --save_freq="$CENTRAL_SAVE_FREQ" \
       ${ENV_ARGS[@]:+"${ENV_ARGS[@]}" "${ALL_TARGET[@]}" --env_eval_freq="$((ENV_EVAL_EVERY * LOCAL_STEPS))"} \
       --batch_size="$BATCH_SIZE" --num_workers="$NUM_WORKERS" --seed="$SEED" \
       "${MP_ARGS[@]}" "${WANDB_ARGS[@]}" --job_name="${JOB_PREFIX}cen-b$BUDGET-s$SEED" \
       --output_dir="$CEN" \
       2>&1 | tee "$CEN.log" | grep -E "^INFO.*step" || true
     assert_trained "$CEN" "centralized-b$BUDGET-s$SEED"
+    archive_run "$CEN"
     run_eval "centralized-b$BUDGET-s$SEED" "$CEN" "$TASK_KEYS"
     record "centralized" "$SEED" __overall__ "$(success_rate "$CEN/eval")"
     record_per_task "centralized" "$SEED" "$CEN/eval"
@@ -605,13 +754,14 @@ run_seed_group() {
       echo "--> local: client $c alone on $C_TASKS (budget $BUDGET, seed $SEED, $LOCAL_ARM_STEPS steps)"
       "${TRAIN[@]}" "${POLICY_ARGS[@]}" \
         --dataset.repo_id="$DATASET" --dataset.episodes="$C_EPS" \
-        --steps="$LOCAL_ARM_STEPS" --save_freq="$LOCAL_ARM_STEPS" \
+        --steps="$LOCAL_ARM_STEPS" --save_freq="$LOCAL_SAVE_FREQ" \
         ${ENV_ARGS[@]:+"${ENV_ARGS[@]}" "${C_TARGET[@]}" --env_eval_freq="$((ENV_EVAL_EVERY * LOCAL_STEPS))"} \
         --batch_size="$BATCH_SIZE" --num_workers="$NUM_WORKERS" --seed="$SEED" \
         "${MP_ARGS[@]}" "${WANDB_ARGS[@]}" --job_name="${JOB_PREFIX}loc-c$c-b$BUDGET-s$SEED" \
         --output_dir="$LOC" \
         2>&1 | tee "$LOC.log" | grep -E "^INFO.*step" || true
       assert_trained "$LOC" "local-c$c-b$BUDGET-s$SEED"
+      archive_run "$LOC"
       # Own tasks answer "what does this client achieve unaided?"; all tasks additionally
       # answer "what did specialising cost it elsewhere?".
       if [[ "$LOCAL_EVAL_ALL_TASKS" == "1" ]]; then
@@ -630,6 +780,7 @@ if [[ "$RUN_FEDERATED$RUN_CENTRALIZED$RUN_LOCAL" != *1* ]]; then
   exit 1
 fi
 
+echo "study: $STUDY  (commit $GIT_COMMIT)"
 echo "seeds: $SEEDS"
 echo "arms: federated=$RUN_FEDERATED centralized=$RUN_CENTRALIZED local=$RUN_LOCAL"
 echo "budgets (rounds): $BUDGETS"
@@ -638,6 +789,7 @@ for BUDGET in $BUDGETS; do
   banner "budget: $BUDGET rounds x $LOCAL_STEPS local steps = $((BUDGET * LOCAL_STEPS)) updates/client"
   for SEED in $SEEDS; do
     run_seed_group "$BUDGET" "$SEED"
+    sync_study_files
   done
 done
 
@@ -793,7 +945,7 @@ EOS
 if [[ -n "$WANDB_PROJECT" ]]; then
   echo
   echo "Uploading study results to W&B project '$WANDB_PROJECT'..."
-  python - "$SUMMARY" "$WANDB_PROJECT" "$WANDB_ENTITY" "$LOCAL_STEPS" "$(basename "$OUT_ROOT")" <<'WB_EOF' || echo "!! W&B upload failed (results are still in $SUMMARY)"
+  python - "$SUMMARY" "$WANDB_PROJECT" "$WANDB_ENTITY" "$LOCAL_STEPS" "$STUDY" <<'WB_EOF' || echo "!! W&B upload failed (results are still in $SUMMARY)"
 import statistics
 import sys
 from collections import defaultdict
@@ -890,7 +1042,14 @@ print("uploaded")
 WB_EOF
 fi
 
+printf "FINISHED='%s'\n" "$(date '+%Y-%m-%d %H:%M:%S')" >> "$OUT_ROOT/study.env"
+sync_study_files
+
 echo "Raw logs and checkpoints: $OUT_ROOT"
+if [[ "$ARCHIVE" == "1" ]]; then
+  echo "Model archives (copy these off the cluster): $MODELS_DIR"
+  echo "Evaluate one without unpacking: bash examples/federated/eval_archive.sh <archive>.tar.gz"
+fi
 
 
 
