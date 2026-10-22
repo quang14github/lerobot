@@ -299,6 +299,13 @@ if [[ -z "${MUJOCO_GL:-}" ]] && grep -qi microsoft /proc/version 2>/dev/null; th
 else
   export MUJOCO_GL="${MUJOCO_GL:-egl}"
 fi
+# Under WSL, glx alone renders on the CPU (Mesa's llvmpipe); Mesa's d3d12 driver renders on the
+# NVIDIA GPU through WSL's DirectX bridge instead, ~1.7x faster per LIBERO episode. Values you set
+# yourself win (GALLIUM_DRIVER=llvmpipe restores CPU rendering).
+if [[ "$MUJOCO_GL" == "glx" ]] && grep -qi microsoft /proc/version 2>/dev/null; then
+  export GALLIUM_DRIVER="${GALLIUM_DRIVER:-d3d12}"
+  export MESA_D3D12_DEFAULT_ADAPTER_NAME="${MESA_D3D12_DEFAULT_ADAPTER_NAME:-NVIDIA}"
+fi
 
 # NOTE: BATCH_SIZE is an experimental variable, not only a throughput knob. Both arms share it
 # so the comparison stays internally valid, but numbers are not comparable across runs with
