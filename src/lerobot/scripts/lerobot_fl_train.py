@@ -77,7 +77,7 @@ from lerobot.federated.aggregate import (
     reset_optimizer_state,
     set_trainable_state,
 )
-from lerobot.federated.config import FederatedTrainPipelineConfig
+from lerobot.federated.config import FederatedConfig, FederatedTrainPipelineConfig
 from lerobot.federated.partition import ClientShard, format_partition, partition_episodes
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies import make_policy, make_pre_post_processors
@@ -128,12 +128,29 @@ def _client_config(cfg: FederatedTrainPipelineConfig, shard: ClientShard) -> Fed
     return client_cfg
 
 
-def _client_weight(shard: ClientShard, weighting: str) -> float:
-    if weighting == "frames":
+def _client_weight(shard: ClientShard, fl: FederatedConfig) -> float:
+    if fl.client_weighting == "custom":
+        # Validated to hold one positive weight per client, indexed by client id.
+        return float(fl.client_weights[shard.client_id])
+    if fl.client_weighting == "frames":
         return float(shard.num_frames)
-    if weighting == "episodes":
+    if fl.client_weighting == "episodes":
         return float(shard.num_episodes)
     return 1.0
+
+
+def format_client_weights(shards: list[ClientShard], fl: FederatedConfig) -> str:
+    """Each client's tasks and its share of the aggregate when every client takes part.
+
+    Printed before training so a custom weighting can be checked against the partition: client ids
+    are assigned by the partition (shuffled by its seed), so this is where "client 0" gets a task.
+    """
+    weights = [_client_weight(shard, fl) for shard in shards]
+    total = sum(weights)
+    lines = [f"{'client':>6}  {'weight':>10}  {'share':>6}  tasks"]
+    for shard, weight in zip(shards, weights, strict=True):
+        lines.append(f"{shard.client_id:>6}  {weight:>10g}  {weight / total:>6.1%}  {', '.join(shard.tasks)}")
+    return "\n".join(lines)
 
 
 def _client_label(shard: ClientShard, max_len: int = 22) -> str:
@@ -227,6 +244,11 @@ def fl_train(cfg: FederatedTrainPipelineConfig):
         len(shards),
         cfg.partition.strategy,
         format_partition(shards),
+    )
+    logging.info(
+        "Aggregation weights (client_weighting=%s); a round with fewer clients renormalizes over them:\n%s",
+        cfg.fl.client_weighting,
+        format_client_weights(shards, cfg.fl),
     )
 
     # Downloads are episode-selective, so each client would otherwise trigger its own
@@ -409,9 +431,7 @@ def fl_train(cfg: FederatedTrainPipelineConfig):
 
             # 3. Upload: only the weight change leaves the client, and it is folded into the
             # running aggregate immediately rather than kept until the end of the round.
-            accumulator.add(
-                compute_delta(unwrapped, global_state), _client_weight(shard, cfg.fl.client_weighting)
-            )
+            accumulator.add(compute_delta(unwrapped, global_state), _client_weight(shard, cfg.fl))
             client_losses[client_id] = local_loss / cfg.fl.local_steps
             if not cfg.fl.reset_optimizer_each_round:
                 client_optimizer_states[client_id] = copy.deepcopy(optimizer.state_dict())

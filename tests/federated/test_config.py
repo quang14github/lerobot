@@ -60,11 +60,35 @@ def test_accepts_a_reasonable_config(tmp_path):
         ({"fl": FederatedConfig(clients_per_round=99)}, "fl.clients_per_round must be in"),
         ({"fl": FederatedConfig(client_weighting="frame")}, "fl.client_weighting must be"),
         ({"fl": FederatedConfig(prox_mu=-1.0)}, "fl.prox_mu must be >= 0"),
+        ({"fl": FederatedConfig(client_weighting="custom")}, "needs fl.client_weights"),
+        (
+            {"fl": FederatedConfig(client_weighting="custom", client_weights=[2.0, 1.0, 1.0])},
+            "has 3 entries but partition.num_clients=4",
+        ),
+        (
+            {"fl": FederatedConfig(client_weighting="custom", client_weights=[2.0, 1.0, 0.0, 1.0])},
+            "must all be positive",
+        ),
+        (
+            {"fl": FederatedConfig(client_weighting="custom", client_weights=[1.0, float("nan"), 1.0, 1.0])},
+            "must all be positive",
+        ),
+        (
+            {"fl": FederatedConfig(client_weighting="uniform", client_weights=[2.0, 1.0, 1.0, 1.0])},
+            "only used with fl.client_weighting='custom'",
+        ),
     ],
 )
 def test_rejects_invalid_federated_settings(tmp_path, overrides, match):
     with pytest.raises(ValueError, match=match):
         make_config(tmp_path, **overrides).validate()
+
+
+def test_accepts_custom_client_weights(tmp_path):
+    cfg = make_config(tmp_path, fl=FederatedConfig(client_weighting="custom", client_weights=[3, 1, 1, 0.5]))
+    cfg.validate()
+
+    assert cfg.fl.client_weights == [3, 1, 1, 0.5]
 
 
 def test_rejects_unknown_server_optimizer(tmp_path):

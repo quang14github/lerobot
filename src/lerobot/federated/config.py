@@ -20,11 +20,13 @@ additions live under `--fl.*`, `--partition.*` and `--server.*`.
 """
 
 import logging
+import math
 from dataclasses import dataclass, field
 
 from lerobot.configs.train import TrainPipelineConfig
 
 SERVER_OPTIMIZERS = ("fedavg", "fedavgm", "fedadam")
+CLIENT_WEIGHTINGS = ("frames", "episodes", "uniform", "custom")
 
 
 @dataclass
@@ -86,8 +88,13 @@ class FederatedConfig:
     # LoRA or another small trainable surface.
     reset_optimizer_each_round: bool = True
     # Weight each client's delta by its frame count ("frames"), its episode count
-    # ("episodes"), or equally ("uniform").
+    # ("episodes"), equally ("uniform"), or by `client_weights` ("custom").
     client_weighting: str = "frames"
+    # For client_weighting="custom": one positive weight per client, in client-id order (the
+    # weights table logged at startup says which tasks each client holds). Only the ratios
+    # matter: each round the participating clients' weights are normalized to sum to one, so
+    # [2, 1, 1] gives client 0 half of the update whenever all three take part.
+    client_weights: list[float] | None = None
     log_freq_rounds: int = 1
     save_freq_rounds: int = 20
     # Roll out the global policy in the env every N rounds (0 = never). Requires --env.type.
@@ -119,10 +126,31 @@ class FederatedTrainPipelineConfig(TrainPipelineConfig):
                 f"fl.clients_per_round must be in [0, partition.num_clients="
                 f"{self.partition.num_clients}], got {self.fl.clients_per_round}"
             )
-        if self.fl.client_weighting not in ("frames", "episodes", "uniform"):
+        if self.fl.client_weighting not in CLIENT_WEIGHTINGS:
             raise ValueError(
-                f"fl.client_weighting must be 'frames', 'episodes' or 'uniform', "
-                f"got {self.fl.client_weighting!r}"
+                f"fl.client_weighting must be one of {CLIENT_WEIGHTINGS}, got {self.fl.client_weighting!r}"
+            )
+        weights = self.fl.client_weights
+        if self.fl.client_weighting == "custom":
+            if not weights:
+                raise ValueError(
+                    "fl.client_weighting='custom' needs fl.client_weights, one weight per client, "
+                    "e.g. --fl.client_weights=[2,1,1]"
+                )
+            if len(weights) != self.partition.num_clients:
+                raise ValueError(
+                    f"fl.client_weights has {len(weights)} entries but partition.num_clients="
+                    f"{self.partition.num_clients}; give exactly one weight per client"
+                )
+            if not all(math.isfinite(w) and w > 0 for w in weights):
+                raise ValueError(
+                    f"fl.client_weights must all be positive, got {weights}. To leave a client out, "
+                    f"change the partition instead."
+                )
+        elif weights is not None:
+            raise ValueError(
+                f"fl.client_weights is only used with fl.client_weighting='custom', "
+                f"but client_weighting={self.fl.client_weighting!r}"
             )
         if self.fl.prox_mu < 0:
             raise ValueError(f"fl.prox_mu must be >= 0, got {self.fl.prox_mu}")

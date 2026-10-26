@@ -22,6 +22,7 @@
 #   SERVER_TYPE=fedadam SERVER_LR=1e-3 bash ...                   # adaptive aggregation
 #   PROX_MU=0.05 bash ...                                         # the FedProx penalty
 #   CLIENT_WEIGHTING=uniform bash ...                              # equal vote per client
+#   CLIENT_WEIGHTS=2,1,1 bash ...                                  # your own weights: client 0 counts double
 #   TASKS_PER_CLIENT=1 TASKS=reach-v3,window-open-v3,door-open-v3 bash ...  # one task each
 #   TASKS=<9 comma-separated slugs> bash ...                       # different tasks
 #   WANDB_PROJECT=fl-noniid bash ...                               # stream to Weights & Biases
@@ -163,6 +164,22 @@ PROX_MU="${PROX_MU:-0.0}"
 #   episodes  - by its episode count.
 #   uniform   - one client, one vote, however much data it holds.
 CLIENT_WEIGHTING="${CLIENT_WEIGHTING:-frames}"
+# Or set your own: one positive weight per client, comma-separated, in client-id order - e.g.
+# CLIENT_WEIGHTS=2,1,1 gives client 0 half of every update. This replaces CLIENT_WEIGHTING. Which
+# task each client holds is decided by the partition (PARTITION_SEED), so the script prints a
+# client -> task table with each client's share at startup: check it before trusting a run.
+CLIENT_WEIGHTS="${CLIENT_WEIGHTS:-}"
+if [[ -n "$CLIENT_WEIGHTS" ]]; then
+  CLIENT_WEIGHTING=custom
+  if [[ ! "$CLIENT_WEIGHTS" =~ ^[0-9]*\.?[0-9]+(,[0-9]*\.?[0-9]+)*$ ]]; then
+    echo "!! CLIENT_WEIGHTS must be comma-separated positive numbers, e.g. 2,1,1 (got \"$CLIENT_WEIGHTS\")"
+    exit 1
+  fi
+  if (($(tr ',' '\n' <<< "$CLIENT_WEIGHTS" | wc -l) != NUM_CLIENTS)); then
+    echo "!! CLIENT_WEIGHTS has $(tr ',' '\n' <<< "$CLIENT_WEIGHTS" | wc -l) weight(s) but NUM_CLIENTS=$NUM_CLIENTS; give one per client"
+    exit 1
+  fi
+fi
 
 # ----------------------------------------------------------------------------------------
 # Where the study goes, and what it is called
@@ -178,7 +195,7 @@ CLIENT_WEIGHTING="${CLIENT_WEIGHTING:-frames}"
 #   task ids     LIBERO only: ids are single digits, so t012 is unambiguous. Meta-World slugs
 #                are too long to list - see TASKS in study.env.
 #   aggregation  SERVER_TYPE, + SERVER_LR when it is not 1.0, + _prox<mu> when FedProx is on.
-#   weighting    frm | uni | epi (CLIENT_WEIGHTING).
+#   weighting    frm | uni | epi (CLIENT_WEIGHTING), or w<weights> for CLIENT_WEIGHTS, e.g. w2-1-1.
 #   TAG          optional free text for why you ran it, e.g. TAG=weightablation.
 #
 # Arm, budget and seed are left out: a study holds several of each, and they name the run folders
@@ -201,6 +218,7 @@ case "$CLIENT_WEIGHTING" in
   frames) STUDY_ID+="_frm" ;;
   uniform) STUDY_ID+="_uni" ;;
   episodes) STUDY_ID+="_epi" ;;
+  custom) STUDY_ID+="_w${CLIENT_WEIGHTS//,/-}" ;;
   *) STUDY_ID+="_$CLIENT_WEIGHTING" ;;
 esac
 STUDY_ID+="_ls${LOCAL_STEPS}_bs${BATCH_SIZE}${TAG:+_$TAG}"
@@ -459,6 +477,43 @@ print("[" + ",".join(str(e) for e in shard.episodes) + "]\t" + ",".join(sorted(k
 SHARD_EOF
 }
 
+# The client -> task table of the partition the federated arm will use, with each client's
+# aggregation weight and its share of a round, computed by the trainer's own weight function.
+# Client ids come from the partition (shuffled by PARTITION_SEED), so this is the table to read
+# before choosing CLIENT_WEIGHTS.
+describe_clients() {
+  python - "$DATASET" "$1" "$NUM_CLIENTS" "$PARTITION_SEED" "$TASK_TABLE" "$CLIENT_WEIGHTING" "$CLIENT_WEIGHTS" <<'CLIENTS_EOF'
+import json
+import sys
+
+from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
+from lerobot.federated.config import FederatedConfig, PartitionConfig
+from lerobot.federated.partition import partition_episodes
+from lerobot.scripts.lerobot_fl_train import _client_weight
+
+dataset, eps_json, num_clients, seed, table, weighting, weights = sys.argv[1:8]
+shards = partition_episodes(
+    LeRobotDatasetMetadata(dataset),
+    PartitionConfig(strategy="task", num_clients=int(num_clients), seed=int(seed)),
+    episodes=json.loads(eps_json),
+)
+key_of = {}
+for line in open(table):
+    key, description = line.rstrip("\n").split("\t", 1)
+    key_of.setdefault(description, key)
+fl = FederatedConfig(
+    client_weighting=weighting,
+    client_weights=[float(w) for w in weights.split(",")] if weights else None,
+)
+values = [_client_weight(shard, fl) for shard in shards]
+total = sum(values)
+print(f"clients (partition seed {seed}, client_weighting={weighting}):")
+for shard, value in zip(shards, values, strict=True):
+    tasks = ", ".join(key_of.get(t, t) for t in shard.tasks)
+    print(f"  client {shard.client_id}: weight {value:g} ({value / total:.0%} of a round)  {tasks}")
+CLIENTS_EOF
+}
+
 # The env flags that roll out exactly the given comma-separated task keys, one flag per line
 # (read them with mapfile). LIBERO evaluates a suite restricted to task ids; Meta-World takes the
 # slugs directly.
@@ -617,7 +672,7 @@ write_study_env() {
     for var in STUDY STARTED GIT_COMMIT \
       BENCHMARK SUITE DATASET TASKS TASK_KEYS NUM_CLIENTS TASKS_PER_CLIENT PARTITION_SEED \
       BUDGETS SEEDS LOCAL_STEPS BATCH_SIZE SAVE_EVERY NUM_WORKERS MIXED_PRECISION \
-      SERVER_TYPE SERVER_LR PROX_MU CLIENT_WEIGHTING \
+      SERVER_TYPE SERVER_LR PROX_MU CLIENT_WEIGHTING CLIENT_WEIGHTS \
       RUN_FEDERATED RUN_CENTRALIZED RUN_LOCAL LOCAL_EVAL_ALL_TASKS MATCH_CENTRAL_TO_CLIENT \
       EVAL_EPISODES SKIP_EVAL ENV_EVAL_EVERY ENV_EVAL_EPISODES MUJOCO_GL \
       WANDB_PROJECT WANDB_ENTITY WANDB_ARTIFACTS ARCHIVE TAG OUT_ROOT MODELS_DIR HOSTNAME; do
@@ -694,6 +749,7 @@ write_task_table > "$TASK_TABLE"
 echo "tasks ($SUITE_SHORT):"
 EPS="$(episodes_for_tasks "$TASK_KEYS")"
 echo "episodes: $(echo "$EPS" | tr -cd ',' | wc -c | awk '{print $1+1}') selected"
+describe_clients "$EPS"
 
 # Env flags covering every task, for the arms that roll out on all of them.
 mapfile -t ALL_TARGET < <(env_target "$TASK_KEYS")
@@ -731,6 +787,7 @@ run_seed_group() {
       --partition.seed="$PARTITION_SEED" \
       --fl.rounds="$BUDGET" --fl.local_steps="$LOCAL_STEPS" --fl.save_freq_rounds="$SAVE_EVERY" \
       --fl.prox_mu="$PROX_MU" --fl.client_weighting="$CLIENT_WEIGHTING" \
+      ${CLIENT_WEIGHTS:+--fl.client_weights="[$CLIENT_WEIGHTS]"} \
       --server.type="$SERVER_TYPE" --server.lr="$SERVER_LR" \
       ${FED_ENV_ARGS[@]:+"${FED_ENV_ARGS[@]}" "${ALL_TARGET[@]}"} \
       --batch_size="$BATCH_SIZE" --num_workers="$NUM_WORKERS" --seed="$SEED" \
