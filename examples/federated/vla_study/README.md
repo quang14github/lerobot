@@ -40,6 +40,7 @@ are the planned study:
 | `CEN_NUM_WORKERS` | 12 | data-loader workers of the centralized arm |
 | `CLIENT_WEIGHTING`, `CLIENT_OPT_STATE` | `uniform`, `reset` | |
 | `DEVICE`, `EVAL_DEVICE` | `cuda`, `cuda` | `EVAL_DEVICE=cpu` evaluates on the CPU |
+| `PARAM_DTYPE` | `float32` | parameter dtype (compute is bf16 autocast); `null` keeps SmolVLA's own bf16 weights |
 | `EVAL_EPISODES`, `EVAL_SEED` | 10, 1000 | per task, for every evaluation |
 | `TAG`, `WANDB_PROJECT` | empty | a note in study names; stream to Weights & Biases |
 
