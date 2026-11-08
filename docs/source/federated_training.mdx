@@ -203,6 +203,6 @@ checkpoint) and `manifest.json` (each client's episodes and each task's share at
 
 - Single process only — no `torchrun`, no FSDP. Multi-GPU would parallelize *clients*, which is
   not implemented yet.
-- `--ema.enable` and `--dataset.streaming` are rejected: an EMA shadow would track one client's
-  local trajectory, and streaming datasets cannot honor per-client episode allowlists.
+- `--ema.type` (any EMA) and `--dataset.streaming` are rejected: an EMA shadow would track one
+  client's local trajectory, and streaming datasets cannot honor per-client episode allowlists.
 - Reward-model training is policy-only for now.
