@@ -22,6 +22,7 @@ additions live under `--fl.*`, `--partition.*` and `--server.*`.
 import logging
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from lerobot.configs.train import TrainPipelineConfig
 
@@ -110,6 +111,21 @@ class FederatedConfig:
     save_freq_rounds: int = 20
     # Roll out the global policy in the env every N rounds (0 = never). Requires --env.type.
     env_eval_freq_rounds: int = 0
+    # Save `checkpoints/000000` - the pretrained model with this run's processors - before round 1.
+    # With rounds=0 the run stops right after it, which is how untrained baselines are produced.
+    save_initial_checkpoint: bool = False
+    # Continue from `output_dir/fl_state` when it exists (an existing output_dir is then expected),
+    # otherwise start fresh. This is what lets one command run as a chain of time-limited jobs.
+    auto_resume: bool = False
+    # Write the resumable run state every N completed rounds (and always on SIGUSR1/SIGTERM).
+    resume_save_freq_rounds: int = 1
+    # Stop as if signalled after this many rounds of the current invocation (0 = never). For tests.
+    stop_after_rounds: int = 0
+    # Resume even when settings that define the run differ from the saved state.
+    allow_config_change: bool = False
+    # After setup, run one forward/backward on a few samples and list trainable parameters that
+    # get no gradient (written to grad_audit.json). Costs one extra step; for smoke tests.
+    audit_gradients: bool = False
 
 
 @dataclass
@@ -125,11 +141,20 @@ class FederatedTrainPipelineConfig(TrainPipelineConfig):
         # `steps` is inherited and drives the LR scheduler's horizon. In a federated run the
         # scheduler advances once per *round* (see the orchestrator), so the horizon is the
         # round count, not the total number of local updates.
-        self.steps = self.fl.rounds
+        self.steps = max(self.fl.rounds, 1)
+        # With auto_resume the output directory of an earlier link is expected to exist; hide it
+        # from the parent's "would overwrite" check, which only knows checkpoint-based resume.
+        existing_output = None
+        if self.fl.auto_resume and isinstance(self.output_dir, Path) and self.output_dir.is_dir():
+            existing_output, self.output_dir = self.output_dir, None
         super().validate()
+        if existing_output is not None:
+            self.output_dir = existing_output
 
-        if self.fl.rounds < 1:
-            raise ValueError(f"fl.rounds must be >= 1, got {self.fl.rounds}")
+        if self.fl.rounds < 1 and not (self.fl.rounds == 0 and self.fl.save_initial_checkpoint):
+            raise ValueError(
+                f"fl.rounds must be >= 1 (or 0 with fl.save_initial_checkpoint=true), got {self.fl.rounds}"
+            )
         if self.fl.local_steps < 1:
             raise ValueError(f"fl.local_steps must be >= 1, got {self.fl.local_steps}")
         if not 0 <= self.fl.clients_per_round <= self.partition.num_clients:
@@ -186,8 +211,12 @@ class FederatedTrainPipelineConfig(TrainPipelineConfig):
             )
         if self.resume:
             raise NotImplementedError(
-                "--resume is not supported yet for federated runs; restart from the last saved "
-                "global checkpoint with --policy.path=<checkpoint>/pretrained_model."
+                "--resume is not used by federated runs: pass --fl.auto_resume=true with the original "
+                "arguments and --output_dir, and the run continues from output_dir/fl_state."
+            )
+        if self.fl.resume_save_freq_rounds < 1:
+            raise ValueError(
+                f"fl.resume_save_freq_rounds must be >= 1, got {self.fl.resume_save_freq_rounds}"
             )
 
         # `eval_split` holds out the tail episodes of every task *before* partitioning, so the

@@ -161,6 +161,15 @@ class ServerOptimizer(ABC):
     def step(self, global_state: StateDelta, aggregate: StateDelta) -> None:
         """Update `global_state` in place from the round's aggregated delta."""
 
+    def state_dict(self) -> dict[str, StateDelta]:
+        """Buffers carried across rounds (none for plain FedAvg), for resuming a run."""
+        return {}
+
+    def load_state_dict(self, state: dict[str, StateDelta]) -> None:
+        """Restore the buffers written by `state_dict`."""
+        if state:
+            raise ValueError(f"{type(self).__name__} has no state to restore, got keys {list(state)}")
+
 
 class FedAvg(ServerOptimizer):
     """`global <- global + lr * aggregate` (McMahan et al. 2017; plain averaging at lr=1)."""
@@ -196,6 +205,14 @@ class FedAvgM(ServerOptimizer):
             buffer.mul_(self.beta1).add_(value)
             global_state[name].add_(buffer, alpha=self.lr)
 
+    def state_dict(self) -> dict[str, StateDelta]:
+        """The momentum buffer."""
+        return {"momentum": self._momentum}
+
+    def load_state_dict(self, state: dict[str, StateDelta]) -> None:
+        """Restore the momentum buffer."""
+        self._momentum = {k: v.clone() for k, v in state.get("momentum", {}).items()}
+
 
 class FedAdam(ServerOptimizer):
     """Adam on the server, over the aggregated delta (Reddi et al., ICLR 2021).
@@ -225,6 +242,15 @@ class FedAdam(ServerOptimizer):
             m.mul_(self.beta1).add_(value, alpha=1.0 - self.beta1)
             v.mul_(self.beta2).addcmul_(value, value, value=1.0 - self.beta2)
             global_state[name].addcdiv_(m, v.sqrt().add_(self.eps), value=self.lr)
+
+    def state_dict(self) -> dict[str, StateDelta]:
+        """Both moment estimates."""
+        return {"m": self._m, "v": self._v}
+
+    def load_state_dict(self, state: dict[str, StateDelta]) -> None:
+        """Restore both moment estimates."""
+        self._m = {k: v.clone() for k, v in state.get("m", {}).items()}
+        self._v = {k: v.clone() for k, v in state.get("v", {}).items()}
 
 
 def make_server_optimizer(cfg) -> ServerOptimizer:
