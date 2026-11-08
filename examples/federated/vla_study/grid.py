@@ -8,7 +8,7 @@ reproduce the planned study:
   BENCHMARKS="libero_object libero_goal libero_spatial metaworld_mt10"
   RUN_LORA=1 RUN_FULL=1 RUN_FEDERATED=1 RUN_CENTRALIZED=1          (switches)
   CLIENT_WEIGHTING=uniform CLIENT_OPT_STATE=reset NUM_WORKERS=3 CEN_NUM_WORKERS=12
-  DEVICE=cuda MIXED_PRECISION=bf16
+  DEVICE=cuda MIXED_PRECISION=bf16 PARAM_DTYPE=float32   (PARAM_DTYPE=null: SmolVLA's own bf16 weights)
   EVAL_EPISODES=10 EVAL_SEED=1000 EVAL_DEVICE=cuda
   STUDY_ROOT=outputs/fedvla TAG= WANDB_PROJECT=
 
@@ -83,6 +83,7 @@ class Settings:
     num_workers: int
     cen_num_workers: int
     device: str
+    param_dtype: str
     mixed_precision: str
     eval_episodes: int
     eval_seed: int
@@ -113,6 +114,7 @@ class Settings:
             num_workers=int(_env("NUM_WORKERS", "3")),
             cen_num_workers=int(_env("CEN_NUM_WORKERS", "12")),
             device=_env("DEVICE", "cuda"),
+            param_dtype=_env("PARAM_DTYPE", "float32"),
             mixed_precision=_env("MIXED_PRECISION", "bf16"),
             eval_episodes=int(_env("EVAL_EPISODES", "10")),
             eval_seed=int(_env("EVAL_SEED", "1000")),
@@ -293,7 +295,7 @@ def federated_command(
         f"--accelerator.mixed_precision={s.mixed_precision}",
         f"--output_dir={output_dir}",
         f"--job_name={spec.study_id(s)}-{spec.run_id()}",
-        *vla_study.policy_args(spec.mode, device=s.device),
+        *vla_study.policy_args(spec.mode, device=s.device, dtype=s.param_dtype),
         *vla_study.peft_args(spec.mode),
         *vla_study.scheduler_args(s.rounds, s.local_steps, s.num_clients, "federated"),
         *_wandb_args(s),
@@ -326,7 +328,7 @@ def centralized_command(
         "--prune_checkpoints=true",
         "--env_eval_freq=0",
         "--log_freq=250",
-        *vla_study.policy_args(spec.mode, device=s.device),
+        *vla_study.policy_args(spec.mode, device=s.device, dtype=s.param_dtype),
         *vla_study.peft_args(spec.mode),
         *vla_study.scheduler_args(s.rounds, s.local_steps, s.num_clients, "centralized"),
         *_wandb_args(s),

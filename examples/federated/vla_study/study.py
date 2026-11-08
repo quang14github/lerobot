@@ -843,6 +843,8 @@ def cmd_smoke_legacy(args, s: Settings) -> int:
         "OUT_ROOT": str(out),
         "BENCHMARK": "libero",
         "SUITE": "libero_object",
+        # noniid.sh calls `python`: make that this interpreter, even when the environment is not activated.
+        "PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.environ.get('PATH', '')}",
     }
     rc = run_logged(
         ["bash", REPO_ROOT / "examples" / "federated" / "noniid.sh"], out.parent / "legacy.log", env=env

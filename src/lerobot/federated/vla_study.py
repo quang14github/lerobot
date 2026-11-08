@@ -67,8 +67,11 @@ LORA_FULL_RANK_MODULES = [
 N_ACTION_STEPS = 10
 
 
-def policy_args(mode: str, device: str = "cuda") -> list[str]:
-    """`--policy.*` flags that build SmolVLA from its pretrained checkpoint for `mode`."""
+def policy_args(mode: str, device: str = "cuda", dtype: str = "float32") -> list[str]:
+    """`--policy.*` flags that build SmolVLA from its pretrained checkpoint for `mode`.
+
+    `dtype="null"` keeps SmolVLA's own bfloat16 weights, as in its published code.
+    """
     if mode not in MODES:
         raise ValueError(f"unknown mode {mode!r}; expected one of {MODES}")
     return [
@@ -79,6 +82,9 @@ def policy_args(mode: str, device: str = "cuda") -> list[str]:
         # Both modes: LoRA adapters inside the VLM need it in train mode and on the graph.
         "--policy.train_expert_only=false",
         "--policy.freeze_vision_encoder=false",
+        # Train float32 weights (compute runs in bf16 autocast): smolvla_base is stored in bfloat16,
+        # where an AdamW step of 1e-4 rounds to no change for about half of the weights.
+        f"--policy.dtype={dtype}",
         "--policy.push_to_hub=false",
         f"--policy.device={device}",
         f"--policy.n_action_steps={N_ACTION_STEPS}",

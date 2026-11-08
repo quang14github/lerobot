@@ -94,6 +94,13 @@ def test_trainable_parameter_count(mode, tmp_path):
     assert sum(trainable(model).values()) == EXPECTED[mode]
 
 
+@pytest.mark.parametrize("mode", list(EXPECTED))
+def test_trainable_weights_are_float32(mode, tmp_path):
+    """smolvla_base is stored in bfloat16, where most 1e-4 AdamW steps would round to no change."""
+    _, model = build(mode, tmp_path)
+    assert {p.dtype for p in model.parameters() if p.requires_grad} == {torch.float32}
+
+
 def test_full_unfreezes_the_backbone(tmp_path):
     _, model = build("full", tmp_path)
     names = trainable(model)

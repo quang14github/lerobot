@@ -106,6 +106,12 @@ class SmolVLAConfig(PreTrainedConfig):
     compile_model: bool = False  # Whether to use torch.compile for model optimization
     compile_mode: str = "max-autotune"  # Torch compile mode
 
+    # Parameter dtype. None keeps the dtypes the model is built with: the pretrained VLM and the action
+    # expert are bfloat16. "float32" holds every parameter in float32 (compute can still run in bf16
+    # through autocast, e.g. --accelerator.mixed_precision=bf16). Worth it when training the backbone:
+    # in bfloat16, an AdamW step of 1e-4 rounds to no change for about half of smolvla_base's weights.
+    dtype: str | None = None
+
     def __post_init__(self):
         super().__post_init__()
 
@@ -115,6 +121,8 @@ class SmolVLAConfig(PreTrainedConfig):
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
                 f"{self.n_action_steps} for `n_action_steps` and {self.chunk_size} for `chunk_size`."
             )
+        if self.dtype not in (None, "float32"):
+            raise ValueError(f"dtype must be None or 'float32', got {self.dtype!r}")
         if self.use_delta_joint_actions_aloha:
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
