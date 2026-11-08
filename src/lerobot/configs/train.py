@@ -174,8 +174,8 @@ class TrainPipelineConfig(HubMixin):
     # just the final model (useful to monitor progress mid-run). Optional; the
     # final model is pushed regardless. Works the same locally and remotely.
     save_checkpoint_to_hub: bool = False
-    # On SIGUSR1/SIGTERM (e.g. Slurm's `--signal=B:USR1@<seconds>` warning before a time limit), save
-    # a checkpoint at the current step and exit with code 75; `--resume` then continues from it.
+    # On Ctrl-C, SIGTERM or SIGUSR1, save a checkpoint at the current step and exit with code 75;
+    # `--resume` then continues from it. A second Ctrl-C aborts without saving.
     checkpoint_on_signal: bool = False
     # Keep optimizer/scheduler state only in the newest checkpoint, and delete checkpoints written
     # off the `save_freq` grid (signal checkpoints) once a newer one exists. Saves disk on large

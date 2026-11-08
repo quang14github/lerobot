@@ -149,8 +149,8 @@ def verify_pretrained_weights(
     if mismatched:
         raise RuntimeError(
             f"{len(mismatched)} of {len(probe)} probed tensors differ from {pretrained_path} "
-            f"(e.g. {mismatched[:3]}): the policy does not hold its pretrained weights. pi0.5 falls back "
-            "to random weights silently when its checkpoint cannot be read; check the Hugging Face cache."
+            f"(e.g. {mismatched[:3]}): the policy does not hold its pretrained weights. Some policies fall "
+            "back to random weights silently when their checkpoint cannot be read; check the Hugging Face cache."
         )
     logging.info("Verified %d tensors of the policy against %s", len(probe), weights_file)
     return len(probe)

@@ -11,15 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Resumable state of a federated run, and stopping cleanly on a scheduler's warning signal.
+"""Resumable state of a federated run, and stopping cleanly on Ctrl-C or a termination signal.
 
 A federated run is resumed from the end of its last *completed* round. Everything the next round
 depends on is restored: the server's trainable weights and optimizer, the round counter, the LR
 scheduler, every random generator, each client's position in its own data stream, and (when kept)
-each client's optimizer state. A round interrupted by a signal is dropped and replayed on resume;
-a round can take longer than a job's warning window, so finishing it is not an option.
+each client's optimizer state. A round interrupted by a signal is dropped and replayed on resume,
+so a stop request takes effect after the current step instead of after a whole round.
 
-The state is written to a temporary directory and swapped in with renames, so a job killed
+The state is written to a temporary directory and swapped in with renames, so a process killed
 mid-write leaves the previous state intact.
 """
 
@@ -68,13 +68,14 @@ class TrainingInterrupted(Exception):  # noqa: N818 - a control-flow signal, not
 
 
 class StopRequest:
-    """Turns SIGUSR1 / SIGTERM into a flag the training loop polls between steps.
+    """Turns Ctrl-C (SIGINT), SIGTERM and SIGUSR1 into a flag the training loop polls between steps.
 
-    Slurm's `--signal=B:USR1@<seconds>` warns the batch script before the time limit (the script
-    forwards it here), and SIGTERM arrives on `scancel` or at the limit itself.
+    The run then saves its state and exits, and rerunning the same command continues it. A second
+    Ctrl-C aborts immediately, without saving. SIGUSR1 is what job schedulers such as Slurm can send
+    shortly before a time limit (`--signal=USR1@<seconds>`).
     """
 
-    def __init__(self, signals: tuple[int, ...] = (signal.SIGUSR1, signal.SIGTERM)):
+    def __init__(self, signals: tuple[int, ...] = (signal.SIGINT, signal.SIGTERM, signal.SIGUSR1)):
         """Install the handlers; `restore` puts the previous ones back."""
         self.requested = False
         self.signal_name = ""
@@ -83,8 +84,15 @@ class StopRequest:
             self._previous[sig] = signal.signal(sig, self._handle)
 
     def _handle(self, signum, frame):  # noqa: ARG002 - signal handler signature
+        if self.requested and signum == signal.SIGINT:
+            raise KeyboardInterrupt
         if not self.requested:
-            logging.warning("Received %s: stopping after the current step.", signal.Signals(signum).name)
+            hint = " (Ctrl-C again to abort without saving)" if signum == signal.SIGINT else ""
+            logging.warning(
+                "Received %s: saving and stopping after the current step%s.",
+                signal.Signals(signum).name,
+                hint,
+            )
         self.requested = True
         self.signal_name = signal.Signals(signum).name
 

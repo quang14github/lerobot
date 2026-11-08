@@ -13,9 +13,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Each fine-tuning mode of the VLA study trains exactly the intended parameters.
+"""Each fine-tuning mode of the VLA study trains exactly the intended SmolVLA parameters.
 
-The policies are built on the meta device (no weights, no GPU) from the very CLI flags the study
+The policy is built on the meta device (no weights, no GPU) from the very CLI flags the study
 passes to the trainers, so these tests also cover how those flags parse.
 """
 
@@ -33,23 +33,16 @@ from safetensors.torch import save_file
 from lerobot.common.train_utils import verify_pretrained_weights
 from lerobot.configs import FeatureType, PolicyFeature, parser
 from lerobot.federated.config import FederatedTrainPipelineConfig
-from lerobot.federated.tasks import BENCHMARKS
-from lerobot.federated.vla_study import LORA_FULL_RANK_MODULES, peft_args, policy_args
+from lerobot.federated.vla_study import LAST_BACKBONE_LAYER, LORA_FULL_RANK_MODULES, peft_args, policy_args
 
 pytest.importorskip("peft")
 pytest.importorskip("transformers")
 
-LIBERO = BENCHMARKS["libero_object"]
-
 # Exact trainable counts, kept here so any change to the definitions is a visible diff.
-EXPECTED = {
-    ("pi05", "full"): 3_353_433_872,
-    ("pi05", "lora"): 143_115_296,
-    ("smolvla", "full"): 392_904_096,
-    ("smolvla", "lora"): 43_283_280,
-}
-# Adapted Linear layers per component: (vision encoder, language backbone, action expert).
-EXPECTED_ADAPTERS = {"pi05": (162, 126, 126), "smolvla": (72, 112, 112)}
+EXPECTED = {"full": 392_904_096, "lora": 42_361_680}
+# Adapted Linear layers: (vision encoder, language backbone, action expert). The backbone's last
+# layer only gets k/v adapters (2 of its 7 projections): 15 x 7 + 2 = 107.
+EXPECTED_ADAPTERS = (72, 107, 112)
 
 
 @parser.wrap()
@@ -57,15 +50,15 @@ def _parse(cfg: FederatedTrainPipelineConfig) -> FederatedTrainPipelineConfig:
     return cfg
 
 
-def build(policy: str, mode: str, tmp_path: Path):
-    """The policy the trainers would build for (policy, mode), on the meta device."""
+def build(mode: str, tmp_path: Path):
+    """The policy the trainers would build for `mode`, on the meta device."""
     from lerobot.policies.factory import get_policy_class
 
     args = [
-        f"--dataset.repo_id={LIBERO.dataset}",
+        "--dataset.repo_id=lerobot/libero",
         f"--output_dir={tmp_path / 'run'}",
-        *policy_args(policy, mode, LIBERO, device="cpu"),
-        *peft_args(policy, mode),
+        *policy_args(mode, device="cpu"),
+        *peft_args(mode),
     ]
     try:
         with patch.object(sys, "argv", ["lerobot-fl-train", *args]):
@@ -79,8 +72,7 @@ def build(policy: str, mode: str, tmp_path: Path):
         "observation.state": PolicyFeature(type=FeatureType.STATE, shape=(8,)),
     }
     cfg.policy.output_features = {"action": PolicyFeature(type=FeatureType.ACTION, shape=(7,))}
-    if policy == "smolvla":
-        cfg.policy.load_vlm_weights = False  # structure only; the weights come from smolvla_base
+    cfg.policy.load_vlm_weights = False  # structure only; the weights come from smolvla_base
     cfg.policy.device = "meta"
     with torch.device("meta"):
         try:
@@ -96,49 +88,42 @@ def trainable(model) -> dict[str, int]:
     return {n: p.numel() for n, p in model.named_parameters() if p.requires_grad}
 
 
-@pytest.mark.parametrize(("policy", "mode"), list(EXPECTED))
-def test_trainable_parameter_count(policy, mode, tmp_path):
-    _, model = build(policy, mode, tmp_path)
-    assert sum(trainable(model).values()) == EXPECTED[(policy, mode)]
+@pytest.mark.parametrize("mode", list(EXPECTED))
+def test_trainable_parameter_count(mode, tmp_path):
+    _, model = build(mode, tmp_path)
+    assert sum(trainable(model).values()) == EXPECTED[mode]
 
 
-def test_pi05_full_trains_everything_but_the_unused_lm_heads(tmp_path):
-    _, model = build("pi05", "full", tmp_path)
-    frozen = [n for n, p in model.named_parameters() if not p.requires_grad]
-    assert sorted(frozen) == [
-        "model.paligemma_with_expert.gemma_expert.lm_head.weight",
-        "model.paligemma_with_expert.paligemma.lm_head.weight",
-    ]
-    names = trainable(model)
-    assert any("vision_tower" in n for n in names) and any("embed_tokens" in n for n in names)
-
-
-def test_smolvla_full_unfreezes_the_backbone(tmp_path):
-    _, model = build("smolvla", "full", tmp_path)
+def test_full_unfreezes_the_backbone(tmp_path):
+    _, model = build("full", tmp_path)
     names = trainable(model)
     for part in ("vision_model", "text_model", "lm_expert", "connector", "action_out_proj"):
         assert any(part in n for n in names), part
 
 
-@pytest.mark.parametrize("policy", ["pi05", "smolvla"])
-def test_lora_adapts_vision_backbone_and_action_head(policy, tmp_path):
-    _, model = build(policy, "lora", tmp_path)
+def test_lora_adapts_vision_backbone_and_action_head(tmp_path):
+    _, model = build("lora", tmp_path)
     names = trainable(model)
     adapted = {n.rsplit(".lora_A", 1)[0] for n in names if ".lora_A." in n}
     components = Counter()
     for n in adapted:
-        if re.search(r"vision_(tower|model)", n):
+        if re.search(r"vision_model", n):
             components["vision"] += 1
-        elif "gemma_expert" in n or "lm_expert" in n:
+        elif "lm_expert" in n:
             components["expert"] += 1
         else:
             components["backbone"] += 1
-    assert (components["vision"], components["backbone"], components["expert"]) == EXPECTED_ADAPTERS[policy]
+    assert (components["vision"], components["backbone"], components["expert"]) == EXPECTED_ADAPTERS
+    last = f"text_model.layers.{LAST_BACKBONE_LAYER}."
+    assert sorted(n.split(last)[1] for n in adapted if last in n) == ["self_attn.k_proj", "self_attn.v_proj"]
     # Everything trainable is an adapter or one of the listed full-rank modules.
     others = {n for n in names if ".lora_A." not in n and ".lora_B." not in n}
-    full_rank = LORA_FULL_RANK_MODULES[policy]
-    assert others and all(any(f".{m}." in n for m in full_rank) for n in others), sorted(others)[:5]
-    assert {m for m in full_rank if any(f".{m}." in n for n in others)} == set(full_rank)
+    assert others and all(any(f".{m}." in n for m in LORA_FULL_RANK_MODULES) for n in others), sorted(others)[
+        :5
+    ]
+    assert {m for m in LORA_FULL_RANK_MODULES if any(f".{m}." in n for n in others)} == set(
+        LORA_FULL_RANK_MODULES
+    )
 
 
 def test_guard_accepts_loaded_weights_and_rejects_random_ones(tmp_path):

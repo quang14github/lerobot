@@ -117,7 +117,7 @@ class FederatedConfig:
     # Continue from `output_dir/fl_state` when it exists (an existing output_dir is then expected),
     # otherwise start fresh. This is what lets one command run as a chain of time-limited jobs.
     auto_resume: bool = False
-    # Write the resumable run state every N completed rounds (and always on SIGUSR1/SIGTERM).
+    # Write the resumable run state every N completed rounds (and always on Ctrl-C/SIGTERM/SIGUSR1).
     resume_save_freq_rounds: int = 1
     # Stop as if signalled after this many rounds of the current invocation (0 = never). For tests.
     stop_after_rounds: int = 0
