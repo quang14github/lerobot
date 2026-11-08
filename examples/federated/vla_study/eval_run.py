@@ -23,16 +23,20 @@ import time
 from pathlib import Path
 
 
-def _set_render_backend(device: str) -> None:
-    """Pick a MuJoCo backend before any simulator import, unless the caller chose one."""
+def _set_render_backend(device: str, benchmark: str) -> None:
+    """Pick a MuJoCo backend before any simulator import, unless the caller chose one.
+
+    Headless Linux: EGL on a GPU, OSMesa on a CPU, for both simulators. WSL has no headless EGL
+    device, so it renders through its WSLg display instead, and the two simulators need different
+    names for that: LIBERO (robosuite) only accepts `glx`, Meta-World (gymnasium) only `glfw`.
+    """
     if os.environ.get("MUJOCO_GL"):
         return
-    wsl = (
-        "microsoft" in Path("/proc/version").read_text().lower() if Path("/proc/version").exists() else False
-    )
+    version = Path("/proc/version")
+    wsl = version.exists() and "microsoft" in version.read_text().lower()
     if wsl:
-        # WSL has no headless EGL device; glx through WSLg (rendered on the GPU via d3d12) works.
-        os.environ["MUJOCO_GL"] = "glx"
+        os.environ["MUJOCO_GL"] = "glx" if benchmark.startswith("libero") else "glfw"
+        # Render on the NVIDIA GPU through WSL's d3d12 bridge rather than on the CPU.
         os.environ.setdefault("GALLIUM_DRIVER", "d3d12")
         os.environ.setdefault("MESA_D3D12_DEFAULT_ADAPTER_NAME", "NVIDIA")
     else:
@@ -58,7 +62,7 @@ def main() -> int:
     ap.add_argument("--amp", action="store_true", help="bf16 autocast for inference (default float32)")
     args = ap.parse_args()
 
-    _set_render_backend(args.device)
+    _set_render_backend(args.device, args.benchmark)
     if args.device == "cpu":
         os.environ.setdefault("OMP_NUM_THREADS", str(os.cpu_count() or 1))
 
