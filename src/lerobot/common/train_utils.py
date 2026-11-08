@@ -156,6 +156,26 @@ def verify_pretrained_weights(
     return len(probe)
 
 
+def prune_checkpoints(checkpoints_dir: Path, newest: Path, save_freq: int, total_steps: int) -> None:
+    """Free disk once `newest` is written: older checkpoints keep only their model.
+
+    Checkpoints on the `save_freq` grid (and the final one) lose their `training_state/`, which
+    only resuming needs. Checkpoints off the grid were written to stop and resume (on a signal),
+    hold nothing else of value, and are removed entirely.
+    """
+    import shutil
+
+    newest = Path(newest).resolve()
+    for path in Path(checkpoints_dir).iterdir():
+        if path.is_symlink() or not path.is_dir() or not path.name.isdigit() or path.resolve() == newest:
+            continue
+        step = int(path.name)
+        if step == total_steps or (save_freq > 0 and step % save_freq == 0):
+            shutil.rmtree(path / TRAINING_STATE_DIR, ignore_errors=True)
+        else:
+            shutil.rmtree(path, ignore_errors=True)
+
+
 def get_step_identifier(step: int, total_steps: int) -> str:
     """Format a step number as the zero-padded identifier used for checkpoint directory names.
 

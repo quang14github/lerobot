@@ -49,6 +49,7 @@ from lerobot.common.train_utils import (
     get_step_checkpoint_dir,
     get_step_identifier,
     load_training_metadata,
+    prune_checkpoints,
     publish_trained_model,
     push_checkpoint_to_hub,
     resume_after_prepare,
@@ -56,6 +57,7 @@ from lerobot.common.train_utils import (
     save_checkpoint,
     should_save_checkpoint,
     update_last_checkpoint,
+    verify_pretrained_weights,
 )
 from lerobot.common.wandb_utils import WandBLogger
 from lerobot.configs import JobConfig, parser
@@ -70,6 +72,7 @@ from lerobot.distributed import (
     set_fsdp_wrap_modules,
 )
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
+from lerobot.federated.run_state import EXIT_INTERRUPTED, CsvLog, StopRequest, TrainingInterrupted
 from lerobot.jobs import submit_to_hf
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
@@ -80,7 +83,7 @@ from lerobot.utils.collate import lerobot_collate_fn
 from lerobot.utils.constants import PRETRAINED_MODEL_DIR, TRAINING_STATE_DIR
 from lerobot.utils.import_utils import _peft_available, register_third_party_plugins, require_package
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
-from lerobot.utils.random_utils import set_seed
+from lerobot.utils.random_utils import load_rng_state, set_seed
 from lerobot.utils.utils import (
     cycle,
     format_big_number,
@@ -372,6 +375,9 @@ def make_dataloaders(
         prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
         persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
         multiprocessing_context=cfg.dataloader_multiprocessing_context if cfg.num_workers > 0 else None,
+        # Worker seeds are drawn whenever an iterator is created. A private generator keeps those
+        # draws off the global RNG, which a resumed run restores and which drives the policy's noise.
+        generator=torch.Generator().manual_seed(cfg.seed if cfg.seed is not None else 0),
     )
 
     # Build eval dataloader if a held-out split exists
@@ -498,6 +504,17 @@ def train(cfg: TrainPipelineConfig):
             rename_map=cfg.rename_map,
             defer_weight_load=defer_weight_load,
         )
+        if (
+            cfg.policy.pretrained_path
+            and not cfg.resume
+            and not defer_weight_load
+            and not (PeftModel is not None and isinstance(policy, PeftModel))
+        ):
+            # Some policies (pi0.5) fall back to random weights without failing when their
+            # checkpoint cannot be read.
+            verify_pretrained_weights(
+                policy, cfg.policy.pretrained_path, revision=getattr(cfg.policy, "pretrained_revision", None)
+            )
 
     peft_model = None
     if cfg.peft is not None:
@@ -652,6 +669,10 @@ def train(cfg: TrainPipelineConfig):
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
     dl_iter = cycle(dataloader)
+    if cfg.resume and cfg.checkpoint_path is not None:
+        # Restored once before setup (phase 1); building the policy, optimizer and dataloaders draws
+        # from the generators since, so restore again where the interrupted run left off.
+        load_rng_state(cfg.checkpoint_path / TRAINING_STATE_DIR)
     policy.train()
 
     # EMA shadow of the policy weights (Chi et al. 2023, Diffusion Policy, section V.D). The shadow
@@ -760,6 +781,9 @@ def train(cfg: TrainPipelineConfig):
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
 
+    stop = StopRequest() if cfg.checkpoint_on_signal else None
+    checkpoint_log = CsvLog(cfg.output_dir / "checkpoints.csv", ["step", "lr", "checkpoint"])
+
     for _ in range(step, cfg.steps):
         step_start = time.perf_counter()
         batch = next(dl_iter)
@@ -794,7 +818,8 @@ def train(cfg: TrainPipelineConfig):
             progbar.update(1)
         train_tracker.step()
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
-        is_saving_step = should_save_checkpoint(step, cfg.save_freq, cfg.steps)
+        stop_requested = stop is not None and stop.requested
+        is_saving_step = should_save_checkpoint(step, cfg.save_freq, cfg.steps) or stop_requested
         is_env_eval_step = cfg.env_eval_freq > 0 and step % cfg.env_eval_freq == 0
         is_eval_step = cfg.eval_steps > 0 and eval_dataloader is not None and step % cfg.eval_steps == 0
 
@@ -872,6 +897,20 @@ def train(cfg: TrainPipelineConfig):
                         preprocessor.save_pretrained(ema_dir)
                         postprocessor.save_pretrained(ema_dir)
                 update_last_checkpoint(checkpoint_dir)
+                checkpoint_log.append(
+                    [
+                        {
+                            "step": step,
+                            # Some reward models train with a dict of optimizers.
+                            "lr": optimizer.param_groups[0]["lr"]
+                            if hasattr(optimizer, "param_groups")
+                            else "",
+                            "checkpoint": checkpoint_dir.name,
+                        }
+                    ]
+                )
+                if cfg.prune_checkpoints:
+                    prune_checkpoints(checkpoint_dir.parent, checkpoint_dir, cfg.save_freq, cfg.steps)
                 if cfg.save_checkpoint_to_hub:
                     push_checkpoint_to_hub(
                         checkpoint_dir,
@@ -881,6 +920,16 @@ def train(cfg: TrainPipelineConfig):
                 if wandb_logger:
                     wandb_logger.log_policy(checkpoint_dir)
             accelerator.wait_for_everyone()
+
+        if stop_requested and step < cfg.steps:
+            logging.warning(
+                "Stopped (signal) after step %d of %d; resume with --resume=true --config_path=%s",
+                step,
+                cfg.steps,
+                cfg.output_dir / "checkpoints" / "last" / "pretrained_model" / "train_config.json",
+            )
+            stop.restore()
+            raise TrainingInterrupted
 
         if cfg.env and is_env_eval_step:
             if is_main_process():
@@ -939,9 +988,13 @@ def train(cfg: TrainPipelineConfig):
 
             accelerator.wait_for_everyone()
 
+    if stop is not None:
+        stop.restore()
     if is_main_process():
         progbar.close()
         logging.info("End of training")
+        if step >= cfg.steps:
+            (cfg.output_dir / "TRAINING_COMPLETE").write_text(f'{{"steps": {cfg.steps}}}\n')
 
     # --- publish (collective-safe: all ranks; the model commit gathers sharded weights) ---------
     if getattr(active_cfg, "push_to_hub", False):
@@ -1003,7 +1056,10 @@ def main():
         # client-side "Device '...' is not available" warning PreTrainedConfig emits
         # while parsing the config (it fires before train() can dispatch remotely).
         logging.getLogger("lerobot.configs.policies").setLevel(logging.ERROR)
-    train()
+    try:
+        train()
+    except TrainingInterrupted:
+        sys.exit(EXIT_INTERRUPTED)
 
 
 if __name__ == "__main__":
