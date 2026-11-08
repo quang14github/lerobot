@@ -1,6 +1,6 @@
 # Federated LoRA fine-tuning of SmolVLA: decisions, settings and open issues
 
-Branch `fed-vla-finetune`. The study fine-tunes `lerobot/smolvla_base` with LoRA and runs from a
+Branch `federated-smolvla-lora`. The study fine-tunes `lerobot/smolvla_base` with LoRA and runs from a
 terminal; the README gives the procedure. pi0.5, full fine-tuning and the cluster job tooling were
 removed on request.
 
