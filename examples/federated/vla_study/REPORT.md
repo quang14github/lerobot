@@ -7,8 +7,7 @@ removed on request.
 ## What was built
 
 - **Tasks** (`src/lerobot/federated/tasks.py`): resolved by key, with Meta-World `push-v3`
-  separated by the per-frame `task_id` (see "Meta-World push-v3" below). `noniid.sh` uses the same
-  resolver.
+  separated by the per-frame `task_id` (see "Meta-World push-v3" below).
 - **Partitions** (`src/lerobot/federated/partition.py`):
   - task-disjoint: already shuffled by the partition seed, so unchanged;
   - IID: an equal share of every task at every client, within one episode, with leftovers
@@ -22,11 +21,11 @@ removed on request.
 - **Federated trainer** (`lerobot_fl_train.py`):
   - resume from `fl_state`: server weights and optimizer, round, LR schedule, every RNG, each
     client's exact data position, and kept optimizer states;
-  - clean stop on Ctrl-C/SIGTERM/SIGUSR1;
+  - clean stop on Ctrl-C/SIGTERM;
   - per-client and per-round CSV logs, the LR at every checkpoint, the manifest, a
     trainable-parameter breakdown, a gradient audit, and a round-0 checkpoint for baselines;
   - a check that the pretrained weights really loaded.
-- **Centralized trainer** (`lerobot_train.py`): checkpoint-and-exit on Ctrl-C/SIGTERM/SIGUSR1,
+- **Centralized trainer** (`lerobot_train.py`): checkpoint-and-exit on Ctrl-C/SIGTERM,
   optimizer state kept only in the newest checkpoint, the LR log and the weights check. Its resume
   was not bit-exact before and now is.
 - **Study tooling** (this folder): prepare, run (train + evaluate, resumable), eval (GPU or CPU, in
@@ -112,10 +111,11 @@ It costs 0.34 GB of CPU RAM per client, 1.7 GB for 5 clients.
 
 In `lerobot/metaworld_mt50`, `push-v3` and `push-back-v3` were recorded under the same instruction
 ("Push the puck to a goal") and share one `task_index`. Upstream later gave `push-back-v3` its own
-description in `metaworld_config.json`. After that, `noniid.sh`'s twin check could no longer fire,
-and it silently selected 100 episodes for `push-v3`.
+description in `metaworld_config.json`. After that, the earlier study script (`noniid.sh`, now
+removed from the branch) could no longer detect the clash, and silently selected 100 episodes for
+`push-v3`.
 
-Both this study and `noniid.sh` now resolve Meta-World tasks by the per-frame `task_id`:
+This study resolves Meta-World tasks by the per-frame `task_id`:
 - `push-v3` is id 38, episodes 2000-2049, 3,521 frames. Its puck starts at y 0.60-0.70 and is
   pushed out to y 0.80-0.90.
 - `push-back-v3` (id 37, episodes 2100-2149) is excluded.

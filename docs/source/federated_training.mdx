@@ -185,7 +185,7 @@ step, so the decay describes the global model's progress rather than restarting 
 ## Stopping and resuming
 
 Pass `--fl.auto_resume=true` and a fixed `--output_dir`, and a run can be stopped and continued by
-rerunning the same command. Ctrl-C (or SIGTERM / SIGUSR1) stops it after the current local step:
+rerunning the same command. Ctrl-C (or SIGTERM) stops it after the current local step:
 the state of the last completed round is saved to `output_dir/fl_state` and the process exits with
 code 75. A second Ctrl-C aborts without saving. On restart, everything the next round depends on is
 restored: the server's trainable weights and optimizer, the round counter, the LR schedule, every

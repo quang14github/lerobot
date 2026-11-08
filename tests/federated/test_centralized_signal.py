@@ -118,7 +118,7 @@ def test_signal_checkpoint_prune_and_resume(dataset_root, tmp_path, monkeypatch)
         out = real_update(*args, **kwargs)
         calls["n"] += 1
         if calls["n"] == 6:
-            os.kill(os.getpid(), signal.SIGUSR1)
+            os.kill(os.getpid(), signal.SIGTERM)
         return out
 
     chained = tmp_path / "chained"

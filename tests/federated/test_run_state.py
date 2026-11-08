@@ -35,12 +35,11 @@ def test_ctrl_c_requests_a_clean_stop_and_a_second_one_aborts():
     assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
 
 
-@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGUSR1])
-def test_termination_signals_request_a_clean_stop(sig):
+def test_sigterm_requests_a_clean_stop():
     stop = StopRequest()
     try:
-        os.kill(os.getpid(), sig)
-        os.kill(os.getpid(), sig)  # repeated: still just a request
+        os.kill(os.getpid(), signal.SIGTERM)
+        os.kill(os.getpid(), signal.SIGTERM)  # repeated: still just a request
         assert stop.requested
     finally:
         stop.restore()

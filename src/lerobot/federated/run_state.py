@@ -68,14 +68,13 @@ class TrainingInterrupted(Exception):  # noqa: N818 - a control-flow signal, not
 
 
 class StopRequest:
-    """Turns Ctrl-C (SIGINT), SIGTERM and SIGUSR1 into a flag the training loop polls between steps.
+    """Turns Ctrl-C (SIGINT) and SIGTERM into a flag the training loop polls between steps.
 
     The run then saves its state and exits, and rerunning the same command continues it. A second
-    Ctrl-C aborts immediately, without saving. SIGUSR1 is what job schedulers such as Slurm can send
-    shortly before a time limit (`--signal=USR1@<seconds>`).
+    Ctrl-C aborts immediately, without saving.
     """
 
-    def __init__(self, signals: tuple[int, ...] = (signal.SIGINT, signal.SIGTERM, signal.SIGUSR1)):
+    def __init__(self, signals: tuple[int, ...] = (signal.SIGINT, signal.SIGTERM)):
         """Install the handlers; `restore` puts the previous ones back."""
         self.requested = False
         self.signal_name = ""

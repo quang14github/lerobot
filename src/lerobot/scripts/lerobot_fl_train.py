@@ -305,7 +305,7 @@ def fl_train(cfg: FederatedTrainPipelineConfig):
         cfg: The federated training config, parsed from the CLI by `parser.wrap()`.
 
     Raises:
-        TrainingInterrupted: After saving the run state on SIGUSR1/SIGTERM (or
+        TrainingInterrupted: After saving the run state on Ctrl-C/SIGTERM (or
             `fl.stop_after_rounds`); `main` turns it into exit code 75.
     """
     require_package("accelerate", extra="training")

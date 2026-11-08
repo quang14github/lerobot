@@ -795,41 +795,9 @@ def cmd_smoke_resume(args, s: Settings) -> int:
     return 0 if report["pass"] else 1
 
 
-def cmd_smoke_legacy(args, s: Settings) -> int:
-    """The earlier study script (noniid.sh), as a fast plumbing check in the current environment."""
-    out = s.study_root / "smoke" / "legacy"
-    shutil.rmtree(out, ignore_errors=True)
-    env = {
-        "BUDGETS": "2",
-        "LOCAL_STEPS": "2",
-        "SKIP_EVAL": "1",
-        "ARCHIVE": "0",
-        "WANDB_MODE": "disabled",  # noniid.sh treats an empty project as its default one
-        "NUM_WORKERS": "1",
-        "BATCH_SIZE": "8",
-        "SEEDS": "1000",
-        "RUN_LOCAL": "0",
-        "OUT_ROOT": str(out),
-        "BENCHMARK": "libero",
-        "SUITE": "libero_object",
-        # noniid.sh calls `python`: make that this interpreter, even when the environment is not activated.
-        "PATH": f"{Path(sys.executable).parent}{os.pathsep}{os.environ.get('PATH', '')}",
-    }
-    rc = run_logged(
-        ["bash", REPO_ROOT / "examples" / "federated" / "noniid.sh"], out.parent / "legacy.log", env=env
-    )
-    ok = rc == 0 and all(
-        (out / f"{arm}-b2-s1000" / "checkpoints" / "last" / "pretrained_model" / "model.safetensors").exists()
-        for arm in ("federated", "centralized")
-    )
-    write_json(out.parent / "summaries" / "legacy.json", {"exit": rc, "pass": ok})
-    print(f"legacy noniid.sh plumbing check: {'PASS' if ok else 'FAIL'}")
-    return 0 if ok else 1
-
-
 def cmd_smoke(args, s: Settings) -> int:
     cases = [["smoke-case", f"{b}-{a}"] for b in SMOKE_BENCHES for a in ("fed", "cen")]
-    cases += [["smoke-resume"], ["smoke-legacy"]]
+    cases += [["smoke-resume"]]
     if args.only:
         cases = [c for c in cases if args.only in " ".join(c)]
     failed = []
@@ -966,7 +934,6 @@ def main() -> int:
     p.add_argument("--only", help="only cases containing this, e.g. 'metaworld'")
     sub.add_parser("smoke-case").add_argument("name")
     sub.add_parser("smoke-resume")
-    sub.add_parser("smoke-legacy")
     p = sub.add_parser("bench-workers")
     p.add_argument("--workers", nargs="*", type=int, default=[1, 2, 3, 4])
     sub.add_parser("bench-case").add_argument("name")
@@ -988,7 +955,6 @@ def main() -> int:
         "smoke": cmd_smoke,
         "smoke-case": cmd_smoke_case,
         "smoke-resume": cmd_smoke_resume,
-        "smoke-legacy": cmd_smoke_legacy,
         "bench-workers": cmd_bench_workers,
         "bench-case": cmd_bench_case,
         "bench-eval": cmd_bench_eval,

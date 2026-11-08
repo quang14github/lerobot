@@ -1,7 +1,6 @@
 """The grid of the federated SmolVLA (LoRA) fine-tuning study, and the commands that train each run.
 
-Settings are environment variables, in the style of examples/federated/noniid.sh. The defaults
-reproduce the planned study:
+Settings are environment variables. The defaults reproduce the planned study:
 
   ROUNDS=200 LOCAL_STEPS=250 NUM_CLIENTS=5 BATCH_SIZE=64 SAVE_EVERY=20
   SEEDS="1000 2000 3000" PARTITION_SEEDS="1 2 3"     (paired: seed 1000 uses partition seed 1, ...)

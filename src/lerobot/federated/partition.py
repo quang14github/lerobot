@@ -104,10 +104,6 @@ def episode_table(
     return indices, task_of, frames_of
 
 
-# Kept for callers of the previous private name.
-_read_episode_table = episode_table
-
-
 def episode_tasks(meta: LeRobotDatasetMetadata, indices: list[int]) -> dict[int, str]:
     """Map each episode in `indices` to its canonical task string.
 

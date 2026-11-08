@@ -69,7 +69,6 @@ The suite runs these cases:
 - **`smoke-resume`:** interrupts a federated and a centralized run with Ctrl-C (SIGINT) partway,
   restarts them, and checks that they continue from the saved round and finish. A run refuses to
   resume if a setting that defines it changed.
-- **`smoke-legacy`:** the earlier `examples/federated/noniid.sh`, as a plumbing check.
 
 Summaries are in `$STUDY_ROOT/smoke/*/summaries/`. They hold train and eval status, timings,
 checkpoint and state sizes, the trainable-parameter count, and a gradient audit (trainable
