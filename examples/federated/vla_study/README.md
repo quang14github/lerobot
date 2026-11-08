@@ -40,7 +40,7 @@ are the planned study:
 | `CLIENT_WEIGHTING`, `CLIENT_OPT_STATE` | `uniform`, `reset` | |
 | `DEVICE`, `EVAL_DEVICE` | `cuda`, `cuda` | `EVAL_DEVICE=cpu` evaluates on the CPU |
 | `EVAL_EPISODES`, `EVAL_SEED` | 10, 1000 | per task, for every evaluation |
-| `TAG`, `WANDB_PROJECT` | empty | a note in study names; stream to Weights & Biases |
+| `TAG`, `TRACKIO_PROJECT`, `TRACKIO_SPACE_ID` | empty | a note in study names; track runs with Trackio (local database, or a Hugging Face Space if `TRACKIO_SPACE_ID` is set) |
 
 ## 1. Prepare
 

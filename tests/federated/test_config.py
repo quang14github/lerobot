@@ -19,6 +19,7 @@ import pytest
 
 from lerobot.configs.default import DatasetConfig
 from lerobot.federated.config import FederatedConfig, FederatedTrainPipelineConfig, PartitionConfig
+from lerobot.optim.ema import ConstantEMAConfig
 from lerobot.policies.act.configuration_act import ACTConfig
 
 
@@ -112,9 +113,9 @@ def test_rejects_streaming_datasets(tmp_path):
 def test_rejects_ema(tmp_path):
     """An EMA shadow would track whichever client trained last, not the global model."""
     cfg = make_config(tmp_path)
-    cfg.ema.enable = True
+    cfg.ema = ConstantEMAConfig()
 
-    with pytest.raises(NotImplementedError, match="ema.enable"):
+    with pytest.raises(NotImplementedError, match="ema.type"):
         cfg.validate()
 
 

@@ -47,7 +47,7 @@ EXIT_INTERRUPTED = 75  # EX_TEMPFAIL: stopped on request; resume with the same c
 _FINGERPRINT_EXCLUDED = (
     "output_dir",
     "job_name",
-    "wandb",
+    "trackio",
     "num_workers",
     "prefetch_factor",
     "persistent_workers",

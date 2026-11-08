@@ -194,8 +194,9 @@ Time scales with rounds x local steps:
    noise.
 6. **Earlier `push-v3` results.** Any earlier result that used `push-v3` through `noniid.sh` trained
    on `push-back-v3` too.
-7. **Weights & Biases.** If enabled (`WANDB_PROJECT`), each `run` session of a resumed run is a
-   separate W&B run. The CSV logs in each run folder are the complete record.
+7. **Trackio.** If enabled (`TRACKIO_PROJECT`), each `run` session of a federated run is a separate
+   Trackio run. The CSV logs in each run folder are the complete record. (Upstream LeRobot replaced
+   Weights & Biases with Trackio; the earlier studies above were logged to W&B.)
 8. **If full fine-tuning comes back**, train float32 weights. SmolVLA builds its VLM and action
    expert in bfloat16, and in bf16 an AdamW step of 1e-4 rounds to no change for 49% of
    `smolvla_base`'s weights (84% for a quarter-LR step, which is typical for Adam). Commit

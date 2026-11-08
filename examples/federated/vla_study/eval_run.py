@@ -73,7 +73,7 @@ def main() -> int:
     from lerobot.common.train_utils import verify_pretrained_weights
     from lerobot.configs.policies import PreTrainedConfig
     from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
-    from lerobot.envs.configs import LiberoEnv, MetaworldEnv
+    from lerobot.envs.configs import LiberoEnvConfig, MetaworldEnvConfig
     from lerobot.federated.tasks import BENCHMARKS
     from lerobot.policies import make_policy, make_pre_post_processors
     from lerobot.scripts.lerobot_eval import eval_policy_all
@@ -85,9 +85,9 @@ def main() -> int:
     bench = BENCHMARKS[args.benchmark]
     keys = [k for k in args.tasks.split(",") if k] or list(bench.task_keys)
     if bench.env_type == "libero":
-        env_cfg = LiberoEnv(task=bench.suite, task_ids=[int(k.rsplit("_", 1)[1]) for k in keys])
+        env_cfg = LiberoEnvConfig(task=bench.suite, task_ids=[int(k.rsplit("_", 1)[1]) for k in keys])
     else:
-        env_cfg = MetaworldEnv(task=",".join(keys))
+        env_cfg = MetaworldEnvConfig(task=",".join(keys))
 
     ckpt = Path(args.checkpoint).resolve()
     out = Path(args.out)

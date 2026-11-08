@@ -9,7 +9,7 @@ Settings are environment variables. The defaults reproduce the planned study:
   CLIENT_WEIGHTING=uniform CLIENT_OPT_STATE=reset NUM_WORKERS=3 CEN_NUM_WORKERS=12
   DEVICE=cuda MIXED_PRECISION=bf16
   EVAL_EPISODES=10 EVAL_SEED=1000 EVAL_DEVICE=cuda
-  STUDY_ROOT=outputs/vla_study TAG= WANDB_PROJECT=
+  STUDY_ROOT=outputs/vla_study TAG= TRACKIO_PROJECT=
 
 Run identity (no timestamps, so rerunning a command finds and continues the same run):
 
@@ -87,8 +87,8 @@ class Settings:
     eval_batch_size: int
     eval_device: str
     tag: str
-    wandb_project: str
-    wandb_entity: str
+    trackio_project: str
+    trackio_space_id: str
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -115,8 +115,8 @@ class Settings:
             eval_batch_size=int(_env("EVAL_BATCH_SIZE", "1")),
             eval_device=_env("EVAL_DEVICE", "cuda"),
             tag="".join(c if c.isalnum() or c in ".-" else "-" for c in _env("TAG", "")),
-            wandb_project=_env("WANDB_PROJECT", ""),
-            wandb_entity=_env("WANDB_ENTITY", ""),
+            trackio_project=_env("TRACKIO_PROJECT", ""),
+            trackio_space_id=_env("TRACKIO_SPACE_ID", ""),
         )
         s.check()
         return s
@@ -244,12 +244,16 @@ def _apply_overrides(args: list[str], overrides: list[str] | None) -> list[str]:
     return [a for a in args if a.split("=", 1)[0] not in keys] + list(overrides)
 
 
-def _wandb_args(s: Settings) -> list[str]:
-    if not s.wandb_project:
-        return ["--wandb.enable=false"]
-    args = ["--wandb.enable=true", f"--wandb.project={s.wandb_project}", "--wandb.disable_artifact=true"]
-    if s.wandb_entity:
-        args.append(f"--wandb.entity={s.wandb_entity}")
+def _trackio_args(s: Settings) -> list[str]:
+    if not s.trackio_project:
+        return ["--trackio.enable=false"]
+    args = [
+        "--trackio.enable=true",
+        f"--trackio.project={s.trackio_project}",
+        "--trackio.disable_artifact=true",
+    ]
+    if s.trackio_space_id:
+        args.append(f"--trackio.space_id={s.trackio_space_id}")
     return args
 
 
@@ -292,7 +296,7 @@ def federated_command(
         *vla_study.policy_args(device=s.device),
         *vla_study.peft_args(),
         *vla_study.scheduler_args(s.rounds, s.local_steps, s.num_clients, "federated"),
-        *_wandb_args(s),
+        *_trackio_args(s),
     ]
     return _apply_overrides(args, overrides)
 
@@ -325,7 +329,7 @@ def centralized_command(
         *vla_study.policy_args(device=s.device),
         *vla_study.peft_args(),
         *vla_study.scheduler_args(s.rounds, s.local_steps, s.num_clients, "centralized"),
-        *_wandb_args(s),
+        *_trackio_args(s),
     ]
     return _apply_overrides(args, overrides)
 

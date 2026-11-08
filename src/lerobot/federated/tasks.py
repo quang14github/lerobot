@@ -165,9 +165,9 @@ BENCHMARKS: dict[str, BenchmarkSpec] = {
 
 
 def _metaworld_config() -> dict:
-    import lerobot.envs
+    import lerobot.sim.integrations
 
-    return json.loads((Path(lerobot.envs.__file__).parent / "metaworld_config.json").read_text())
+    return json.loads((Path(lerobot.sim.integrations.__file__).parent / "metaworld_config.json").read_text())
 
 
 def episode_column_values(

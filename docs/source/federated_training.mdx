@@ -5,7 +5,7 @@ client trains locally on its own episodes and uploads only a **weight delta**; t
 those deltas into a global model and broadcasts it back. Nothing but weights crosses the boundary.
 
 LeRobot ships this as `lerobot-fl-train`, a drop-in sibling of `lerobot-train`: every existing flag
-(`--dataset.*`, `--policy.*`, `--peft.*`, `--wandb.*`) works the same, plus `--fl.*`,
+(`--dataset.*`, `--policy.*`, `--peft.*`, `--trackio.*`) works the same, plus `--fl.*`,
 `--partition.*` and `--server.*`.
 
 <Tip warning={true}>
@@ -68,7 +68,7 @@ lerobot-fl-train \
   --fl.rounds=400 --fl.local_steps=50 --fl.clients_per_round=3 \
   --fl.env_eval_freq_rounds=50 \
   --server.type=fedadam --server.lr=1e-3 \
-  --batch_size=32 --wandb.enable=true --wandb.project=fl-smolvla-mt50 \
+  --batch_size=32 --trackio.enable=true --trackio.project=fl-smolvla-mt50 \
   --policy.push_to_hub=false
 ```
 

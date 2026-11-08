@@ -14,7 +14,7 @@
 """Configuration for federated training.
 
 `FederatedTrainPipelineConfig` extends `TrainPipelineConfig`, so every existing knob
-(`--dataset.*`, `--policy.*`, `--peft.*`, `--wandb.*`, ...) keeps working and a federated run is
+(`--dataset.*`, `--policy.*`, `--peft.*`, `--trackio.*`, ...) keeps working and a federated run is
 reproducible from its `train_config.json` the same way a centralized one is. The federated
 additions live under `--fl.*`, `--partition.*` and `--server.*`.
 """
@@ -199,9 +199,9 @@ class FederatedTrainPipelineConfig(TrainPipelineConfig):
                 "fl.env_eval_freq_rounds > 0 requires an environment (e.g. --env.type=metaworld or libero)."
             )
 
-        if self.ema.enable:
+        if self.ema is not None:
             raise NotImplementedError(
-                "--ema.enable is not supported under federated training: the shadow would track "
+                "--ema.type is not supported under federated training: the shadow would track "
                 "one client's local trajectory rather than the global model."
             )
         if self.dataset.streaming:

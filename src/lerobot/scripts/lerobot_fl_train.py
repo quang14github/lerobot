@@ -55,6 +55,7 @@ import torch
 from termcolor import colored
 from tqdm import tqdm
 
+from lerobot.common.trackio_utils import TrackioLogger
 from lerobot.common.train_utils import (
     get_step_checkpoint_dir,
     get_step_identifier,
@@ -64,7 +65,6 @@ from lerobot.common.train_utils import (
     update_last_checkpoint,
     verify_pretrained_weights,
 )
-from lerobot.common.wandb_utils import WandBLogger
 from lerobot.configs import parser
 from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 from lerobot.datasets.factory import make_dataset
@@ -347,8 +347,8 @@ def fl_train(cfg: FederatedTrainPipelineConfig):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     logging.info(pformat(cfg.to_dict()))
-    wandb_logger = WandBLogger(cfg) if (cfg.wandb.enable and cfg.wandb.project) else None
-    if wandb_logger is None:
+    trackio_logger = TrackioLogger(cfg) if (cfg.trackio.enable and cfg.trackio.project) else None
+    if trackio_logger is None:
         logging.info(colored("Logs will be saved locally.", "yellow", attrs=["bold"]))
 
     if cfg.seed is not None:
@@ -790,7 +790,7 @@ def fl_train(cfg: FederatedTrainPipelineConfig):
                     rss_total,
                     per_client,
                 )
-                if wandb_logger:
+                if trackio_logger:
                     log_dict = tracker.to_dict()
                     log_dict.update(
                         {
@@ -808,7 +808,7 @@ def fl_train(cfg: FederatedTrainPipelineConfig):
                     )
                     for client_id, loss in client_losses.items():
                         log_dict[f"fl/client_{client_id}_loss"] = loss
-                    wandb_logger.log_dict(log_dict, rnd)
+                    trackio_logger.log_dict(log_dict, rnd)
                 tracker.reset_averages()
             progbar.update(1)
 
@@ -845,15 +845,15 @@ def fl_train(cfg: FederatedTrainPipelineConfig):
                 )
                 if cfg.save_checkpoint_to_hub:
                     push_checkpoint_to_hub(checkpoint_dir, cfg.policy.repo_id, private=cfg.policy.private)
-                if wandb_logger:
-                    wandb_logger.log_policy(checkpoint_dir)
+                if trackio_logger:
+                    trackio_logger.log_policy(checkpoint_dir)
 
             if cfg.env is not None and (
                 cfg.fl.env_eval_freq_rounds > 0 and rnd % cfg.fl.env_eval_freq_rounds == 0
             ):
                 step_id = get_step_identifier(rnd, cfg.fl.rounds)
                 logging.info(f"Evaluating the global policy after round {rnd}")
-                with _make_eval_envs(cfg) as eval_envs, torch.no_grad(), accelerator.autocast():
+                with _make_eval_envs(cfg.env, cfg.eval) as eval_envs, torch.no_grad(), accelerator.autocast():
                     eval_info = eval_policy_all(
                         envs=eval_envs,
                         policy=unwrapped,
@@ -869,8 +869,8 @@ def fl_train(cfg: FederatedTrainPipelineConfig):
                     )
                 aggregated = eval_info["overall"]
                 logging.info("round %d eval: %s", rnd, aggregated)
-                if wandb_logger:
-                    wandb_logger.log_dict(
+                if trackio_logger:
+                    trackio_logger.log_dict(
                         {f"eval/{k}": v for k, v in aggregated.items() if isinstance(v, int | float)},
                         rnd,
                         mode="eval",
@@ -901,6 +901,9 @@ def fl_train(cfg: FederatedTrainPipelineConfig):
         progbar.close()
         if proximal is not None:
             proximal.detach()
+        if trackio_logger:
+            # Flush on a stop too, so the metrics of an interrupted session are kept.
+            trackio_logger.finish()
 
     _write_json(
         output_dir / "TRAINING_COMPLETE",
