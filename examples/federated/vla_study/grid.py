@@ -9,7 +9,7 @@ Settings are environment variables. The defaults reproduce the planned study:
   CLIENT_WEIGHTING=uniform CLIENT_OPT_STATE=reset NUM_WORKERS=3 CEN_NUM_WORKERS=12
   DEVICE=cuda MIXED_PRECISION=bf16
   EVAL_EPISODES=10 EVAL_SEED=1000 EVAL_DEVICE=cuda
-  STUDY_ROOT=outputs/fedvla TAG= WANDB_PROJECT=
+  STUDY_ROOT=outputs/vla_study TAG= WANDB_PROJECT=
 
 Run identity (no timestamps, so rerunning a command finds and continues the same run):
 
@@ -93,7 +93,7 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         s = cls(
-            study_root=Path(_env("STUDY_ROOT", str(REPO_ROOT / "outputs" / "fedvla"))).resolve(),
+            study_root=Path(_env("STUDY_ROOT", str(REPO_ROOT / "outputs" / "vla_study"))).resolve(),
             rounds=int(_env("ROUNDS", "200")),
             local_steps=int(_env("LOCAL_STEPS", "250")),
             num_clients=int(_env("NUM_CLIENTS", "5")),

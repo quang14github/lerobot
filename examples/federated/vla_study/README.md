@@ -29,7 +29,7 @@ are the planned study:
 
 | Variable | Default | |
 |---|---|---|
-| `STUDY_ROOT` | `outputs/fedvla` | where everything is written |
+| `STUDY_ROOT` | `outputs/vla_study` | where everything is written |
 | `ROUNDS`, `LOCAL_STEPS`, `NUM_CLIENTS`, `BATCH_SIZE` | 200, 250, 5, 64 | the centralized arm takes ROUNDS x LOCAL_STEPS x NUM_CLIENTS steps |
 | `SAVE_EVERY` | 20 | checkpoint (and evaluation) interval in rounds |
 | `SEEDS`, `PARTITION_SEEDS` | `1000 2000 3000`, `1 2 3` | paired one to one |

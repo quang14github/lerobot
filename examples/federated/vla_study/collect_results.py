@@ -3,7 +3,7 @@
 
   python examples/federated/vla_study/collect_results.py [STUDY_ROOT]
 
-Writes, under STUDY_ROOT (default outputs/fedvla):
+Writes, under STUDY_ROOT (default outputs/vla_study):
 
   results.csv          one row per (run, evaluated round, task)
   client_losses.csv    every federated run's per-client, per-round training loss

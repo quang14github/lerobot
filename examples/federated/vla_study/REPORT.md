@@ -124,7 +124,7 @@ Any earlier result that used `push-v3` through `noniid.sh` was trained on both t
 
 ## Throughput
 
-**Earlier federated studies.** These ran on an A100 80GB at batch 64 (W&B project `fedvla`), with
+**Earlier federated studies.** These ran on an A100 80GB at batch 64 (logged to Weights & Biases), with
 SmolVLA training only its action expert. They are context for the LoRA numbers, not LoRA numbers.
 
 | arm | LIBERO | Meta-World |

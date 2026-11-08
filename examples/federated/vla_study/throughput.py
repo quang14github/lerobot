@@ -18,7 +18,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import grid  # noqa: E402
 
-# Earlier federated studies on an A100 80GB (W&B project fedvla): SmolVLA with only its action
+# Earlier federated studies on an A100 80GB (logged to Weights & Biases): SmolVLA with only its action
 # expert trainable, batch 64. Context for the LoRA numbers measured here.
 EARLIER = {"LIBERO": 1.9, "Meta-World": 2.4}
 CHECKPOINTS_PER_RUN = 10  # rounds 20, 40, ..., 200
