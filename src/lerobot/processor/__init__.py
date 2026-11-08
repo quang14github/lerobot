@@ -31,11 +31,13 @@ from .converters import (
     identity_transition,
     observation_to_transition,
     policy_action_to_transition,
+    policy_output_to_transition,
     robot_action_observation_to_transition,
     robot_action_to_transition,
     transition_to_batch,
     transition_to_observation,
     transition_to_policy_action,
+    transition_to_prediction,
     transition_to_robot_action,
 )
 from .delta_action_processor import MapDeltaActionToRobotActionStep, MapTensorToDeltaActionDictStep
@@ -66,6 +68,7 @@ from .hil_processor import (
     RewardClassifierProcessorStep,
     TimeLimitProcessorStep,
 )
+from .image_augmentation_processor import ImageAugmentationProcessorStep
 from .newline_task_processor import NewLineTaskProcessorStep
 from .normalize_processor import NormalizerProcessorStep, UnnormalizerProcessorStep, hotswap_stats
 from .observation_processor import VanillaObservationProcessorStep
@@ -107,16 +110,19 @@ __all__ = [
     "AddTeleopActionAsComplimentaryDataStep",
     "AddTeleopEventsAsInfoStep",
     "ComplementaryDataProcessorStep",
+    "ImageAugmentationProcessorStep",
     "batch_to_transition",
     "create_transition",
     "from_tensor_to_numpy",
     "identity_transition",
     "observation_to_transition",
     "policy_action_to_transition",
+    "policy_output_to_transition",
     "robot_action_observation_to_transition",
     "robot_action_to_transition",
     "transition_to_observation",
     "transition_to_policy_action",
+    "transition_to_prediction",
     "transition_to_robot_action",
     "DeviceProcessorStep",
     "DoneProcessorStep",
