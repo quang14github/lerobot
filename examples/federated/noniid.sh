@@ -96,8 +96,8 @@ esac
 # masquerading as client drift. More tasks per client keeps the heterogeneity while removing
 # that confound. TASKS must hold exactly NUM_CLIENTS x TASKS_PER_CLIENT entries.
 #
-# Meta-World: task slugs. Avoid push-v3 and push-back-v3: they share a description string and the
-# resolver rejects them.
+# Meta-World: task slugs. push-v3 and push-back-v3 were recorded under one instruction; episodes
+# are told apart by their per-frame task_id (lerobot.federated.tasks), never by the instruction.
 # LIBERO: task ids within SUITE. LIBERO tasks hold 29-50 demos each (failed ones were filtered),
 # so unlike Meta-World the shards are not exactly equal in size.
 if [[ "$BENCHMARK" == "libero" ]]; then
@@ -406,32 +406,37 @@ TT_EOF
 # does NOT follow its id: in Meta-World the two disagree for 23 of the 50 tasks, and in LIBERO
 # the episodes of different tasks are interleaved. The key -> instruction legend goes to stderr.
 episodes_for_tasks() {
-  python - "$1" "$DATASET" "$TASK_TABLE" <<'PYEOF'
+  python - "$1" "$DATASET" "$TASK_TABLE" "$BENCHMARK" <<'PYEOF'
+import json
 import sys
+from pathlib import Path
 
+import lerobot.envs
 from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
-from lerobot.federated.partition import episode_tasks
+from lerobot.federated.tasks import resolve_task_episodes
 
 keys = sys.argv[1].split(",")
 desc = dict(line.rstrip("\n").split("\t", 1) for line in open(sys.argv[3]))
+unknown = [key for key in keys if key not in desc]
+if unknown:
+    sys.exit(f"unknown task(s) {unknown}; known: {', '.join(desc)}")
 
-meta = LeRobotDatasetMetadata(sys.argv[2])
-task_of = episode_tasks(meta, list(range(meta.total_episodes)))
+# Meta-World's push-v3 and push-back-v3 share one instruction (and one task_index) in the dataset,
+# so an instruction lookup would return both tasks' episodes. The per-frame task_id separates them.
+frame_ids = None
+if sys.argv[4] == "metaworld":
+    config = json.loads((Path(lerobot.envs.__file__).parent / "metaworld_config.json").read_text())
+    frame_ids = {key: int(config["TASK_NAME_TO_ID"][key]) for key in keys}
+
+try:
+    resolved = resolve_task_episodes(LeRobotDatasetMetadata(sys.argv[2]), {k: desc[k] for k in keys}, frame_ids)
+except ValueError as err:
+    sys.exit(str(err))
 
 out = []
 for key in keys:
-    if key not in desc:
-        sys.exit(f"unknown task {key!r}; known: {', '.join(desc)}")
-    # Meta-World's push-v3 and push-back-v3 share one instruction, so a lookup by instruction
-    # would return both tasks' episodes. Refuse rather than silently doubling the data.
-    twins = [k for k, d in desc.items() if d == desc[key] and k != key]
-    if twins:
-        sys.exit(f"{key!r} shares its instruction with {twins}; their episodes cannot be told apart")
-    hits = [ep for ep, task in task_of.items() if task == desc[key]]
-    if not hits:
-        sys.exit(f"no episodes found for {key!r} ({desc[key]!r}) in this dataset")
-    print(f"  {key:<20} {len(hits):>3} episodes  {desc[key]}", file=sys.stderr)
-    out.extend(hits)
+    print(f"  {key:<20} {len(resolved[key]):>3} episodes  {desc[key]}", file=sys.stderr)
+    out.extend(resolved[key])
 
 print("[" + ",".join(str(i) for i in sorted(out)) + "]")
 PYEOF

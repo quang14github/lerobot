@@ -17,20 +17,30 @@ The partition is computed once, on the server, from dataset *metadata* only — 
 read. Each client is then handed an episode allowlist that it passes to `LeRobotDataset(...,
 episodes=...)`, which is the same mechanism as `--dataset.episodes` on the CLI.
 
-Three strategies, in increasing order of realism:
+Strategies:
 
-- ``uniform``: episodes shuffled and split evenly. IID; the sanity-check baseline where
-  federated averaging should closely track centralized training.
+- ``uniform``: episodes shuffled and split evenly. IID in expectation; the sanity-check baseline
+  where federated averaging should closely track centralized training.
+- ``iid``: every client gets an equal-sized random share of *every* task's episodes (sizes differ
+  by at most one episode per task, and leftovers rotate between clients so totals stay balanced).
 - ``dirichlet``: every task's episodes are split across clients with proportions drawn from
   ``Dir(alpha)``. ``alpha -> inf`` approaches uniform, ``alpha -> 0`` approaches disjoint
   tasks; ``alpha ~= 0.5`` is the usual "moderately non-IID" setting in the FL literature.
 - ``task``: each client owns a disjoint set of tasks. The pathological label-skew case, and
   the one that matters for Meta-World: a client that has never seen `door-open-v3` must still
-  end up with a global policy that can do it.
+  end up with a global policy that can do it. Tasks are shuffled by the seed before dealing.
+- ``shared_core``: ``num_shared_tasks`` tasks, drawn by the seed, are split equally across all
+  clients (as in ``iid``); every other task is given whole to one client.
+- ``explicit``: the tasks each client holds are named in ``task_assignment``.
+
+Tasks are the dataset's instruction strings, unless ``task_map`` names each episode's task key -
+needed when two tasks share an instruction (see `lerobot.federated.tasks`).
 """
 
+import json
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import pyarrow.parquet as pq
@@ -39,7 +49,7 @@ from lerobot.datasets.dataset_metadata import LeRobotDatasetMetadata
 
 from .config import PartitionConfig
 
-PARTITION_STRATEGIES = ("uniform", "dirichlet", "task", "explicit")
+PARTITION_STRATEGIES = ("uniform", "iid", "dirichlet", "task", "shared_core", "explicit")
 
 
 @dataclass
@@ -57,13 +67,21 @@ class ClientShard:
         return len(self.episodes)
 
 
-def _read_episode_table(
-    meta: LeRobotDatasetMetadata, episodes: list[int] | None
+def load_task_map(path: str | Path) -> dict[int, str]:
+    """Read a `{"episode_tasks": {"<episode>": "<task key>"}}` file into episode -> task key."""
+    payload = json.loads(Path(path).read_text())
+    return {int(ep): str(task) for ep, task in payload["episode_tasks"].items()}
+
+
+def episode_table(
+    meta: LeRobotDatasetMetadata, episodes: list[int] | None, task_map: dict[int, str] | None = None
 ) -> tuple[list[int], dict[int, str], dict[int, int]]:
     """Return the episode indices in play, plus their task and frame count.
 
     Rows of `meta.episodes` are indexed by episode index, matching how
-    `lerobot.datasets.factory.make_train_eval_datasets` reads the same table.
+    `lerobot.datasets.factory.make_train_eval_datasets` reads the same table. With `task_map`,
+    tasks are its task keys instead of the dataset's instruction strings, and every episode in
+    play must appear in it.
     """
     if meta.episodes is None:
         raise ValueError(f"Dataset {meta.repo_id} has no episode metadata to partition.")
@@ -71,10 +89,23 @@ def _read_episode_table(
     ep_from = meta.episodes["dataset_from_index"]
     ep_to = meta.episodes["dataset_to_index"]
 
-    indices = list(range(meta.total_episodes)) if episodes is None else list(episodes)
-    task_of = episode_tasks(meta, indices)
+    if episodes is None:
+        indices = sorted(task_map) if task_map is not None else list(range(meta.total_episodes))
+    else:
+        indices = list(episodes)
+    if task_map is not None:
+        unmapped = [ep for ep in indices if ep not in task_map]
+        if unmapped:
+            raise ValueError(f"partition.task_map names no task for episode(s) {unmapped[:10]}.")
+        task_of = {ep: task_map[ep] for ep in indices}
+    else:
+        task_of = episode_tasks(meta, indices)
     frames_of = {ep: int(ep_to[ep]) - int(ep_from[ep]) for ep in indices}
     return indices, task_of, frames_of
+
+
+# Kept for callers of the previous private name.
+_read_episode_table = episode_table
 
 
 def episode_tasks(meta: LeRobotDatasetMetadata, indices: list[int]) -> dict[int, str]:
@@ -225,6 +256,86 @@ def _split_explicit(
     return per_client
 
 
+def _group_by_task(indices: list[int], task_of: dict[int, str]) -> dict[str, list[int]]:
+    by_task: dict[str, list[int]] = {}
+    for ep in indices:
+        by_task.setdefault(task_of[ep], []).append(ep)
+    return {task: sorted(eps) for task, eps in sorted(by_task.items())}
+
+
+class _EqualSplitter:
+    """Splits a task's episodes into `num_clients` random shares whose sizes differ by at most one.
+
+    When a task's episode count does not divide evenly, the clients that receive the extra
+    episode are taken in turn from a rotating pointer (starting at a seeded offset), so across
+    many tasks no client is systematically favoured and client totals also differ by at most one.
+    """
+
+    def __init__(self, num_clients: int, rng: np.random.Generator):
+        self.num_clients = num_clients
+        self.rng = rng
+        self.offset = int(rng.integers(num_clients))
+
+    def split(self, task: str, eps: list[int]) -> list[list[int]]:
+        if len(eps) < self.num_clients:
+            raise ValueError(
+                f"Task {task!r} has {len(eps)} episode(s), fewer than the {self.num_clients} clients "
+                f"that must each receive a share of it."
+            )
+        shuffled = [int(ep) for ep in self.rng.permutation(eps)]
+        base, extra = divmod(len(shuffled), self.num_clients)
+        lucky = {(self.offset + j) % self.num_clients for j in range(extra)}
+        self.offset = (self.offset + extra) % self.num_clients
+        shares, start = [], 0
+        for client_id in range(self.num_clients):
+            size = base + (1 if client_id in lucky else 0)
+            shares.append(shuffled[start : start + size])
+            start += size
+        return shares
+
+
+def _split_iid(
+    indices: list[int], task_of: dict[int, str], num_clients: int, rng: np.random.Generator
+) -> list[list[int]]:
+    splitter = _EqualSplitter(num_clients, rng)
+    per_client: list[list[int]] = [[] for _ in range(num_clients)]
+    for task, eps in _group_by_task(indices, task_of).items():
+        for client_id, share in enumerate(splitter.split(task, eps)):
+            per_client[client_id].extend(share)
+    return per_client
+
+
+def _split_shared_core(
+    indices: list[int],
+    task_of: dict[int, str],
+    num_clients: int,
+    num_shared: int,
+    rng: np.random.Generator,
+) -> list[list[int]]:
+    """Split `num_shared` seeded tasks equally across all clients; give each other task to one.
+
+    Unique tasks are dealt over a seeded client order, one each when there are `num_clients` of them.
+    """
+    by_task = _group_by_task(indices, task_of)
+    tasks = list(by_task)
+    if not 0 <= num_shared <= len(tasks):
+        raise ValueError(f"partition.num_shared_tasks={num_shared} must be in [0, {len(tasks)}].")
+    order = [str(t) for t in rng.permutation(tasks)]
+    shared, unique = sorted(order[:num_shared]), order[num_shared:]
+    if len(unique) < num_clients and num_shared == 0:
+        raise ValueError("shared_core with no shared tasks needs at least one unique task per client.")
+
+    per_client: list[list[int]] = [[] for _ in range(num_clients)]
+    splitter = _EqualSplitter(num_clients, rng)
+    for task in shared:
+        for client_id, share in enumerate(splitter.split(task, by_task[task])):
+            per_client[client_id].extend(share)
+    client_order = [int(c) for c in rng.permutation(num_clients)]
+    for i, task in enumerate(unique):
+        per_client[client_order[i % num_clients]].extend(by_task[task])
+    return per_client
+
+
 def _split_uniform(indices: list[int], num_clients: int, rng: np.random.Generator) -> list[list[int]]:
     shuffled = rng.permutation(indices)
     return [[int(ep) for ep in chunk] for chunk in np.array_split(shuffled, num_clients)]
@@ -234,6 +345,7 @@ def partition_episodes(
     meta: LeRobotDatasetMetadata,
     cfg: PartitionConfig,
     episodes: list[int] | None = None,
+    task_map: dict[int, str] | None = None,
 ) -> list[ClientShard]:
     """Split `episodes` (default: all of them) into `cfg.num_clients` disjoint shards.
 
@@ -242,6 +354,8 @@ def partition_episodes(
         cfg: Strategy, client count, Dirichlet concentration and seed.
         episodes: Optional episode allowlist to partition within (e.g. from
             `--dataset.episodes`). `None` means every episode in the dataset.
+        task_map: Optional episode -> task key mapping that replaces the instruction strings as
+            the unit of partitioning. Defaults to the file named by `cfg.task_map`, if any.
 
     Returns:
         One `ClientShard` per client, in client-id order.
@@ -257,7 +371,9 @@ def partition_episodes(
             f"Unknown partition.strategy={cfg.strategy!r}; expected one of {PARTITION_STRATEGIES}"
         )
 
-    indices, task_of, frames_of = _read_episode_table(meta, episodes)
+    if task_map is None and cfg.task_map:
+        task_map = load_task_map(cfg.task_map)
+    indices, task_of, frames_of = episode_table(meta, episodes, task_map)
     if len(indices) < cfg.num_clients:
         raise ValueError(
             f"Cannot split {len(indices)} episode(s) across {cfg.num_clients} clients — "
@@ -273,6 +389,10 @@ def partition_episodes(
         per_client = _split_by_task(indices, task_of, cfg.num_clients, rng)
     elif cfg.strategy == "uniform":
         per_client = _split_uniform(indices, cfg.num_clients, rng)
+    elif cfg.strategy == "iid":
+        per_client = _split_iid(indices, task_of, cfg.num_clients, rng)
+    elif cfg.strategy == "shared_core":
+        per_client = _split_shared_core(indices, task_of, cfg.num_clients, cfg.num_shared_tasks, rng)
     else:
         # A Dirichlet draw can starve a client outright; redraw rather than crash the run
         # several hours in, and only give up if the concentration is hopeless for this
@@ -308,7 +428,87 @@ def partition_episodes(
     empty = [shard.client_id for shard in shards if shard.num_episodes == 0]
     if empty:
         raise ValueError(f"Partition left client(s) {empty} with no episodes; adjust the partition config.")
+    check_exact_cover(shards, indices)
     return shards
+
+
+def check_exact_cover(shards: list[ClientShard], episodes: list[int]) -> None:
+    """Raise unless every episode in `episodes` is held by exactly one client, and no other is."""
+    held: dict[int, list[int]] = {}
+    for shard in shards:
+        for ep in shard.episodes:
+            held.setdefault(ep, []).append(shard.client_id)
+    expected = set(episodes)
+    dropped = sorted(expected - set(held))
+    duplicated = {ep: owners for ep, owners in held.items() if len(owners) > 1}
+    foreign = sorted(set(held) - expected)
+    if dropped or duplicated or foreign:
+        raise ValueError(
+            f"Partition is not an exact cover of its {len(expected)} episodes: "
+            f"dropped={dropped[:10]} (total {len(dropped)}), "
+            f"duplicated={dict(list(duplicated.items())[:10])} (total {len(duplicated)}), "
+            f"unknown={foreign[:10]} (total {len(foreign)})."
+        )
+
+
+def partition_manifest(
+    shards: list[ClientShard],
+    task_of: dict[int, str],
+    frames_of: dict[int, int],
+    cfg: PartitionConfig,
+) -> dict:
+    """Describe a partition for auditing: each client's episodes, and each task's share at each client.
+
+    Shares are given both by episodes and by frames. JSON-serializable; written next to every run.
+    """
+    tasks = sorted({task_of[ep] for shard in shards for ep in shard.episodes})
+    task_eps = {t: sum(1 for s in shards for ep in s.episodes if task_of[ep] == t) for t in tasks}
+    task_frames = {
+        t: sum(frames_of[ep] for s in shards for ep in s.episodes if task_of[ep] == t) for t in tasks
+    }
+
+    clients = []
+    for shard in shards:
+        per_task: dict[str, dict[str, int]] = {}
+        for ep in shard.episodes:
+            entry = per_task.setdefault(task_of[ep], {"episodes": 0, "frames": 0})
+            entry["episodes"] += 1
+            entry["frames"] += frames_of[ep]
+        clients.append(
+            {
+                "client_id": shard.client_id,
+                "num_episodes": shard.num_episodes,
+                "num_frames": shard.num_frames,
+                "tasks": dict(sorted(per_task.items())),
+                "episodes": list(shard.episodes),
+            }
+        )
+
+    task_table = {}
+    for task in tasks:
+        episode_share, frame_share = {}, {}
+        for client in clients:
+            counts = client["tasks"].get(task, {"episodes": 0, "frames": 0})
+            episode_share[str(client["client_id"])] = counts["episodes"] / task_eps[task]
+            frame_share[str(client["client_id"])] = counts["frames"] / task_frames[task]
+        task_table[task] = {
+            "episodes": task_eps[task],
+            "frames": task_frames[task],
+            "clients_holding": sum(1 for share in episode_share.values() if share > 0),
+            "episode_share": episode_share,
+            "frame_share": frame_share,
+        }
+
+    return {
+        "strategy": cfg.strategy,
+        "seed": cfg.seed,
+        "num_clients": len(shards),
+        "num_shared_tasks": cfg.num_shared_tasks if cfg.strategy == "shared_core" else None,
+        "num_episodes": sum(c["num_episodes"] for c in clients),
+        "num_frames": sum(c["num_frames"] for c in clients),
+        "tasks": task_table,
+        "clients": clients,
+    }
 
 
 def format_partition(shards: list[ClientShard], max_tasks_shown: int = 4) -> str:

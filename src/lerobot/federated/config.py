@@ -33,7 +33,10 @@ CLIENT_WEIGHTINGS = ("frames", "episodes", "uniform", "custom")
 class PartitionConfig:
     """How the dataset is split into per-client shards. See `federated.partition`."""
 
-    # "uniform" (IID), "dirichlet" (tunable skew), or "task" (disjoint tasks per client).
+    # "uniform" (episodes shuffled, IID only in expectation), "iid" (an equal share of every task
+    # at every client), "dirichlet" (tunable skew), "task" (disjoint tasks per client),
+    # "shared_core" (some tasks split across all clients, the rest each held by one client) or
+    # "explicit" (see task_assignment).
     strategy: str = "task"
     num_clients: int = 10
     # Concentration for strategy="dirichlet": smaller is more skewed.
@@ -48,6 +51,14 @@ class PartitionConfig:
     # exactly those clients. That one rule expresses asymmetric federations the other strategies
     # cannot - e.g. two clients sharing one task while a third holds a different one.
     task_assignment: dict[str, list[str]] | None = None
+    # For strategy="shared_core": how many tasks are split across every client. The others are
+    # each given whole to one client. Which tasks are shared is drawn from `seed`.
+    num_shared_tasks: int = 5
+    # Optional JSON file {"episode_tasks": {"<episode>": "<task key>"}} naming each episode's task.
+    # Without it tasks are the dataset's instruction strings, which cannot tell apart tasks that
+    # were recorded under one instruction (Meta-World's push-v3 and push-back-v3). See
+    # `lerobot.federated.tasks`.
+    task_map: str | None = None
 
 
 @dataclass
