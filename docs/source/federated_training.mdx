@@ -91,11 +91,17 @@ hard the problem is.
 | --- | --- | --- |
 | `uniform` | A random slice of episodes; every client sees every task | The IID sanity check. Federated averaging should nearly match centralized training here — if it doesn't, something is wrong with the setup, not the algorithm. |
 | `dirichlet` | Each task split across clients with `Dir(alpha)` proportions | Sweeping heterogeneity. `--partition.dirichlet_alpha=0.5` is moderately skewed; lower is harsher. |
-| `task` | A disjoint set of tasks (default) | The realistic and hardest case: a client that has never seen `door-open-v3` must still contribute to a global policy that can do it. |
+| `iid` | An equal random share (within one episode) of every task's episodes | A stricter IID control than `uniform`: every client holds every task in the same proportion. |
+| `task` | A disjoint set of tasks (default), shuffled by the seed | The realistic and hardest case: a client that has never seen `door-open-v3` must still contribute to a global policy that can do it. |
+| `shared_core` | `--partition.num_shared_tasks` tasks split equally across all clients, plus whole tasks of its own | In between: a common core of tasks, plus tasks only one client has. |
 
 The split is computed once from dataset metadata — no frames are read — and logged as a table so
-you can see exactly what each client holds. `--partition.seed` is separate from `--seed`, so the
-same split can be reused across runs that differ only in model or aggregation.
+you can see exactly what each client holds; every partition is checked to hand out each episode
+exactly once. `--partition.seed` is separate from `--seed`, so the same split can be reused across
+runs that differ only in model or aggregation. Tasks are the dataset's instruction strings unless
+`--partition.task_map` names each episode's task: needed when two tasks share an instruction, as
+Meta-World's `push-v3` and `push-back-v3` do in `lerobot/metaworld_mt50` (see
+`lerobot.federated.tasks`).
 
 ## Communication cost
 
@@ -176,12 +182,27 @@ without any client revealing a sample.
 The learning-rate schedule is likewise global, advancing once per **round** rather than per local
 step, so the decay describes the global model's progress rather than restarting with every client.
 
+## Stopping and resuming
+
+Pass `--fl.auto_resume=true` and a fixed `--output_dir`, and a run can be stopped and continued by
+rerunning the same command. Ctrl-C (or SIGTERM / SIGUSR1) stops it after the current local step:
+the state of the last completed round is saved to `output_dir/fl_state` and the process exits with
+code 75. A second Ctrl-C aborts without saving. On restart, everything the next round depends on is
+restored: the server's trainable weights and optimizer, the round counter, the LR schedule, every
+random generator, each client's position in its own data stream, and (with
+`--fl.reset_optimizer_each_round=false`) each client's optimizer state. A resumed run is
+bit-identical to an uninterrupted one on CPU; it refuses to resume when a setting that defines the
+run (or the partition) has changed. The state is also written every `--fl.resume_save_freq_rounds`
+rounds, so a crash loses at most that many rounds.
+
+Each run also writes `client_losses.csv` (every client's loss per round), `rounds.csv` (loss
+spread, update norm, LR, steps/s, peak GPU and host memory), `checkpoints.csv` (the LR at every
+checkpoint) and `manifest.json` (each client's episodes and each task's share at each client).
+
 ## Current limitations
 
 - Single process only — no `torchrun`, no FSDP. Multi-GPU would parallelize *clients*, which is
   not implemented yet.
-- `--resume` is not supported. Restart from a saved global checkpoint with
-  `--policy.path=<checkpoint>/pretrained_model`.
 - `--ema.enable` and `--dataset.streaming` are rejected: an EMA shadow would track one client's
   local trajectory, and streaming datasets cannot honor per-client episode allowlists.
 - Reward-model training is policy-only for now.
