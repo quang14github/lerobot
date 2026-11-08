@@ -15,7 +15,7 @@
 # limitations under the License.
 import contextlib
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any, cast, overload
 
@@ -27,12 +27,14 @@ from huggingface_hub.errors import RevisionNotFoundError
 
 from lerobot.configs import DEFAULT_DEPTH_UNIT, DepthEncoderConfig, RGBEncoderConfig
 from lerobot.utils.constants import HF_LEROBOT_HUB_CACHE
+from lerobot.utils.import_utils import get_safe_default_video_backend
 
 from .dataset_metadata import CODEBASE_VERSION, LeRobotDatasetMetadata
 from .dataset_reader import BaseDatasetReader, DatasetReader
 from .dataset_writer import DatasetWriter
 from .storage import (
     DEFAULT_STORAGE_FORMAT,
+    dataset_location,
     is_remote_uri,
     localize_remote_root,
     make_dataset_reader,
@@ -42,10 +44,7 @@ from .utils import (
     get_safe_version,
     is_valid_version,
 )
-from .video_utils import (
-    StreamingVideoEncoder,
-    get_safe_default_video_backend,
-)
+from .video_utils import StreamingVideoEncoder
 
 logger = logging.getLogger(__name__)
 
@@ -234,7 +233,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if repo_type not in ("dataset", "bucket"):
             raise ValueError(f"repo_type must be 'dataset' or 'bucket', got {repo_type!r}")
         if root is None and repo_type == "bucket":
-            root = f"hf://buckets/{repo_id}"
+            root = dataset_location(repo_id, repo_type=repo_type).uri
         # Datasets can live at an object-store root (e.g. ``hf://datasets/...``): a
         # non-default reader reads the data in place and only ``meta/`` is localized.
         self._storage_root = root if root is not None and is_remote_uri(root) else None
@@ -488,7 +487,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         return reader.hf_dataset
 
     @property
-    def absolute_to_relative_idx(self) -> dict[int, int] | None:
+    def absolute_to_relative_idx(self) -> Mapping[int, int] | None:
         """Mapping from absolute frame indices to relative row positions.
 
         Non-None only for episode-filtered datasets where absolute indices
@@ -674,8 +673,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
             private: If ``True``, create a private repository. If ``None``
                 (default), defer to the org default on the Hub (only affects orgs).
             allow_patterns: Glob pattern(s) restricting which files to upload.
-            upload_large_folder: If ``True``, use ``upload_large_folder`` instead
-                of ``upload_folder`` for very large datasets.
+            upload_large_folder: Kept for backward compatibility and ignored.
+                ``upload_folder`` handles datasets of all sizes.
             **card_kwargs: Additional keyword arguments forwarded to dataset card
                 creation.
         """
@@ -704,18 +703,14 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 exist_ok=True,
             )
 
-        upload_kwargs = {
-            "repo_id": self.repo_id,
-            "folder_path": self.root,
-            "repo_type": "dataset",
-            "revision": branch,
-            "allow_patterns": allow_patterns,
-            "ignore_patterns": ignore_patterns,
-        }
-        if upload_large_folder:
-            hub_api.upload_large_folder(**upload_kwargs)
-        else:
-            hub_api.upload_folder(**upload_kwargs)
+        hub_api.upload_folder(
+            repo_id=self.repo_id,
+            folder_path=self.root,
+            repo_type="dataset",
+            revision=branch,
+            allow_patterns=allow_patterns,
+            ignore_patterns=ignore_patterns,
+        )
 
         card = create_lerobot_dataset_card(
             tags=tags, dataset_info=self.meta.info, license=license, repo_id=self.repo_id, **card_kwargs

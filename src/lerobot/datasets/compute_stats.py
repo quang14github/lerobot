@@ -26,6 +26,8 @@ from lerobot.utils.constants import ACTION, OBS_STATE
 
 from .io_utils import load_image_as_numpy
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_QUANTILES = [0.01, 0.10, 0.50, 0.90, 0.99]
 
 
@@ -61,7 +63,7 @@ class RunningQuantileStats:
         """
         batch = batch.reshape(-1, batch.shape[-1])
         # Promote integer and low-precision inputs before computing squared statistics.
-        batch = batch.astype(np.result_type(batch.dtype, np.float32), copy=False)
+        batch = batch.astype(np.float64, copy=False)
         num_elements, vector_length = batch.shape
 
         # First batch: the running statistics are still unset.
@@ -197,9 +199,9 @@ class RunningQuantileStats:
         idx = np.searchsorted(cumsum, target_count)
 
         if idx == 0:
-            return edges[0]
+            return float(edges[0])
         if idx >= len(cumsum):
-            return edges[-1]
+            return float(edges[-1])
 
         # If not edge case, interpolate within the bin
         count_before = cumsum[idx - 1]
@@ -207,11 +209,11 @@ class RunningQuantileStats:
 
         # If no samples in this bin, use the bin edge
         if count_in_bin == 0:
-            return edges[idx]
+            return float(edges[idx])
 
         # Linear interpolation within the bin
         fraction = (target_count - count_before) / count_in_bin
-        return edges[idx] + fraction * (edges[idx + 1] - edges[idx])
+        return float(edges[idx] + fraction * (edges[idx + 1] - edges[idx]))
 
 
 def estimate_num_samples(
@@ -490,7 +492,7 @@ def get_feature_stats(
     if reshaped.shape[0] < 2:
         stats = _compute_basic_stats(reshaped, sample_count, quantile_list)
     else:
-        running_stats = RunningQuantileStats()
+        running_stats = RunningQuantileStats(quantile_list=quantile_list)
         running_stats.update(reshaped)
         stats = running_stats.get_statistics()
         stats["count"] = np.array([sample_count])
@@ -526,6 +528,9 @@ def compute_episode_stats(
         leading channel axis (e.g. shape (3, 1, 1) for RGB). RGB stats are divided by
         255 to land in [0, 1]; depth maps (features flagged with ``is_depth_map``) skip
         this rescaling and remain in their stored units (stored in ``depth_unit``).
+        The count represents all episode frames, so sampled image/video estimates
+        are weighted by episode length when aggregated. Existing saved statistics
+        are not retroactively updated.
     """
     if quantile_list is None:
         quantile_list = DEFAULT_QUANTILES
@@ -554,6 +559,7 @@ def compute_episode_stats(
         )
 
         if features[key]["dtype"] in ["image", "video"]:
+            ep_stats[key]["count"] = np.array([len(data)])
             normalization_factor = 1.0 if is_depth_map(features[key]) else 255.0
             ep_stats[key] = {
                 k: v if k == "count" else np.squeeze(v / normalization_factor, axis=0)
@@ -746,7 +752,7 @@ def compute_relative_action_stats(
     )
     relative_mask = np.array(mask_step._build_mask(action_dim), dtype=np.float32)
 
-    logging.info("Loading action/state data for relative action stats...")
+    logger.info("Loading action/state data for relative action stats...")
     all_actions = np.array(hf_dataset[ACTION], dtype=np.float32)
     all_states = np.array(hf_dataset[OBS_STATE], dtype=np.float32)
     episode_indices = np.array(hf_dataset["episode_index"])
@@ -758,7 +764,7 @@ def compute_relative_action_stats(
         )
 
     effective_workers = max(num_workers, 1)
-    logging.info(
+    logger.info(
         f"Computing relative action stats from {len(valid_starts)} chunks "
         f"(chunk_size={chunk_size}, workers={effective_workers})"
     )
@@ -795,7 +801,7 @@ def compute_relative_action_stats(
 
     excluded_dims = int(len(relative_mask) - relative_mask.sum())
     total_frames = len(valid_starts) * chunk_size
-    logging.info(
+    logger.info(
         f"Relative action stats ({len(valid_starts)} chunks, {total_frames} frames): "
         f"relative_dims={int(relative_mask.sum())}/{len(relative_mask)} (excluded={excluded_dims}), "
         f"mean={np.abs(stats['mean']).mean():.4f}, std={stats['std'].mean():.4f}, "
