@@ -75,6 +75,87 @@ if TYPE_CHECKING:
     from lerobot.rewards.pretrained import PreTrainedRewardModel
 
 
+def verify_pretrained_weights(
+    policy: "PreTrainedPolicy | Any",
+    pretrained_path: str | Path,
+    revision: str | None = None,
+    num_tensors: int = 16,
+    max_numel: int = 32 * 1024 * 1024,
+) -> int:
+    """Raise unless `policy` actually holds the weights stored at `pretrained_path`.
+
+    Some policies (pi0.5) catch weight-loading errors and carry on from their random init, so a
+    missing or unreadable checkpoint - for instance an incomplete Hugging Face cache on an offline
+    compute node - would otherwise start a long run from scratch without failing. This compares a
+    spread of stored tensors against the live parameters, bit for bit after casting to the live
+    dtype. Tensors whose name the policy does not have (renamed keys, LoRA-wrapped layers) are
+    skipped; tensors above `max_numel` elements are skipped to keep the check cheap.
+
+    Args:
+        policy: The policy (or a PEFT model wrapping it) right after loading.
+        pretrained_path: Local directory or Hub repo id holding `model.safetensors`.
+        revision: Hub revision, when `pretrained_path` is a repo id.
+        num_tensors: How many tensors to compare.
+        max_numel: Largest tensor compared.
+
+    Returns:
+        The number of tensors compared.
+
+    Raises:
+        RuntimeError: If any compared tensor differs, or no tensor could be compared at all.
+    """
+    import torch
+    from huggingface_hub import hf_hub_download
+    from safetensors import safe_open
+
+    local = Path(str(pretrained_path))
+    if local.is_dir():
+        weights_file = local / "model.safetensors"
+    else:
+        weights_file = Path(hf_hub_download(str(pretrained_path), "model.safetensors", revision=revision))
+    base = policy.get_base_model() if hasattr(policy, "get_base_model") else policy
+    state = base.state_dict()
+
+    def live_name(key: str) -> str | None:
+        for candidate in (key, f"model.{key}"):
+            if candidate in state:
+                return candidate
+            stem, _, leaf = candidate.rpartition(".")
+            if f"{stem}.base_layer.{leaf}" in state:
+                return f"{stem}.base_layer.{leaf}"
+        return None
+
+    with safe_open(str(weights_file), framework="pt") as f:
+        candidates = []
+        for key in sorted(f.keys()):
+            name = live_name(key)
+            numel = 1
+            for dim in f.get_slice(key).get_shape():
+                numel *= dim
+            if name is not None and 0 < numel <= max_numel and not state[name].is_meta:
+                candidates.append((key, name))
+        if not candidates:
+            raise RuntimeError(f"No tensor of {weights_file} matches a parameter of the policy.")
+        stride = max(1, len(candidates) // num_tensors)
+        probe = candidates[::stride][:num_tensors]
+        mismatched = []
+        for key, name in probe:
+            stored = f.get_tensor(key)
+            live = state[name].detach()
+            if stored.shape != live.shape or not torch.equal(
+                stored.to(device=live.device, dtype=live.dtype), live
+            ):
+                mismatched.append(name)
+    if mismatched:
+        raise RuntimeError(
+            f"{len(mismatched)} of {len(probe)} probed tensors differ from {pretrained_path} "
+            f"(e.g. {mismatched[:3]}): the policy does not hold its pretrained weights. pi0.5 falls back "
+            "to random weights silently when its checkpoint cannot be read; check the Hugging Face cache."
+        )
+    logging.info("Verified %d tensors of the policy against %s", len(probe), weights_file)
+    return len(probe)
+
+
 def get_step_identifier(step: int, total_steps: int) -> str:
     """Format a step number as the zero-padded identifier used for checkpoint directory names.
 

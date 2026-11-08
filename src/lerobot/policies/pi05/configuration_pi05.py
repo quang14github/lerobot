@@ -104,6 +104,10 @@ class PI05Config(PreTrainedConfig):
     # Finetuning settings
     freeze_vision_encoder: bool = False  # Freeze only the vision encoder
     train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
+    # Freeze the PaliGemma and action-expert `lm_head`s (0.79B with gemma_2b/gemma_300m). The action
+    # model never calls them, so they receive no gradient either way; freezing keeps them out of the
+    # optimizer and out of anything that ships "the trainable parameters" (e.g. federated updates).
+    freeze_lm_heads: bool = False
 
     # Optimizer settings: see openpi `AdamW`
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`

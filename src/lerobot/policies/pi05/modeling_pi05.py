@@ -566,6 +566,9 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             else None
         )
 
+        if getattr(config, "freeze_lm_heads", False):
+            self._freeze_lm_heads()
+
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
@@ -575,6 +578,17 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             self.sample_actions = torch.compile(self.sample_actions, mode=config.compile_mode)
             # Also compile the main forward pass used during training
             self.forward = torch.compile(self.forward, mode=config.compile_mode)
+
+    def _freeze_lm_heads(self):
+        """Freeze both `lm_head`s, which the action model never calls (see `freeze_lm_heads`)."""
+        paligemma = self.paligemma_with_expert.paligemma
+        embed = paligemma.model.language_model.embed_tokens.weight
+        for head in (paligemma.lm_head, self.paligemma_with_expert.gemma_expert.lm_head):
+            if head.weight is embed:
+                raise ValueError(
+                    "lm_head is tied to embed_tokens; freezing it would freeze the token embeddings."
+                )
+            head.weight.requires_grad_(False)
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
