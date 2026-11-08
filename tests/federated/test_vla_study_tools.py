@@ -52,7 +52,7 @@ def settings(tmp_path, monkeypatch):
 
 
 def test_runs_finish_complete_comparisons_first(settings):
-    labels = [r.label() for r in grid.runs_for("lora", 1, settings)]
+    labels = [r.label() for r in grid.runs_for(1, settings)]
     assert labels[:4] == [
         "lora/libero_object/fed-lora-taskdisjoint-s1000-p1",
         "lora/libero_object/cen-lora-s1000",
@@ -60,8 +60,8 @@ def test_runs_finish_complete_comparisons_first(settings):
         "lora/metaworld_mt10/cen-lora-s1000",
     ]
     assert labels[4].endswith("s2000-p2") and len(labels) == 12
-    phase2 = [r.run_id() for r in grid.runs_for("full", 2, settings)]
-    assert phase2[:2] == ["fed-full-iid-s1000-p1", "fed-full-sharedcore-s1000-p1"]
+    phase2 = [r.run_id() for r in grid.runs_for(2, settings)]
+    assert phase2[:2] == ["fed-lora-iid-s1000-p1", "fed-lora-sharedcore-s1000-p1"]
     assert not any(r.startswith("cen") for r in phase2), "phase 2 reuses the centralized runs"
 
 
@@ -78,7 +78,7 @@ def _flags(cmd):
 
 
 def test_federated_and_centralized_commands_match_the_plan(settings):
-    fed = grid.RunSpec("lora", "metaworld_mt10", "federated", "sharedcore", 2000, 2)
+    fed = grid.RunSpec("metaworld_mt10", "federated", "sharedcore", 2000, 2)
     flags = _flags(grid.federated_command(fed, settings, Path("/out")))
     assert flags["--dataset.episodes"] == "[1,3]"
     assert flags["--partition.strategy"] == "shared_core" and flags["--partition.seed"] == "2"
@@ -90,12 +90,12 @@ def test_federated_and_centralized_commands_match_the_plan(settings):
         flags["--policy.scheduler_warmup_steps"] == "6" and flags["--policy.scheduler_decay_steps"] == "200"
     )
 
-    cen = grid.RunSpec("full", "metaworld_mt10", "centralized", None, 2000, None)
+    cen = grid.RunSpec("metaworld_mt10", "centralized", None, 2000, None)
     flags = _flags(grid.centralized_command(cen, settings, Path("/out"), resume=False))
     assert flags["--steps"] == "250000" and flags["--save_freq"] == "25000"
     assert flags["--policy.scheduler_warmup_steps"] == "7500"
     assert flags["--policy.scheduler_decay_steps"] == "250000"
-    assert "--peft.r" not in flags and flags["--checkpoint_on_signal"] == "true"
+    assert flags["--peft.r"] == "64" and flags["--checkpoint_on_signal"] == "true"
     resume = grid.centralized_command(cen, settings, Path("/out"), resume=True)
     assert _flags(resume)["--config_path"].endswith("checkpoints/last/pretrained_model/train_config.json")
 

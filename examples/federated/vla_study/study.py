@@ -1,12 +1,12 @@
 #!/usr/bin/env python
-"""Run the federated SmolVLA fine-tuning study from a terminal.
+"""Run the federated SmolVLA (LoRA) fine-tuning study from a terminal.
 
 See README.md in this folder. Every command can be stopped with Ctrl-C (the current run saves its
 state and stops; a second Ctrl-C aborts) and rerun to continue where it stopped.
 
   prepare        resolve every benchmark's tasks to episodes and check every partition
   prefetch       download the checkpoint and the datasets' episodes up front (optional)
-  plan           list the runs of a mode/phase in order, with their progress
+  plan           list the runs of a phase in order, with their progress
   run            train the runs in order (resuming each), evaluating each one when it finishes
   eval           evaluate every saved, not yet evaluated checkpoint (can run in another terminal)
   baseline       build and evaluate the untrained model on each benchmark
@@ -14,7 +14,7 @@ state and stops; a second Ctrl-C aborts) and rerun to continue where it stopped.
   aggregate      collect all evaluations into results.csv
   smoke          tiny end-to-end tests; bench-workers / bench-eval: throughput measurements
 
-Settings are environment variables (see grid.py), e.g. `RUN_FULL=0 python study.py run`.
+Settings are environment variables (see grid.py), e.g. `RUN_CENTRALIZED=0 python study.py run`.
 """
 
 import argparse
@@ -427,32 +427,6 @@ def eval_targets(run_dir: Path, run: dict) -> list[tuple[int, Path]]:
     return out
 
 
-def prune_after_eval(run_dir: Path, run: dict, rnd: int, ckpt: Path) -> None:
-    """Full mode: drop an evaluated checkpoint's weights, except the final round's and the one a
-    centralized run resumes from. Configs and processors stay, with a PRUNED marker."""
-    if run.get("mode") != "full" or rnd in (0, run["rounds"]):
-        return
-    last = ckpt.parent / "last"
-    if (
-        run.get("arm") == "centralized"
-        and last.exists()
-        and last.resolve() == ckpt.resolve()
-        and not is_complete(run_dir)
-    ):
-        return
-    freed = 0
-    for name in ("model.safetensors", "adapter_model.safetensors"):
-        f = ckpt / "pretrained_model" / name
-        if f.exists():
-            freed += f.stat().st_size
-            f.unlink()
-    shutil.rmtree(ckpt / "training_state", ignore_errors=True)
-    (ckpt / "PRUNED").write_text(
-        f"weights deleted after evaluation, {now()}, freed {freed / 1024**3:.1f} GB\n"
-    )
-    print(f"    pruned {ckpt} ({freed / 1024**3:.1f} GB)")
-
-
 def evaluate_run(
     run_dir: Path, s: Settings, device: str, only_round: int | None = None, tasks: str = ""
 ) -> int:
@@ -489,9 +463,7 @@ def evaluate_run(
             if tasks:
                 cmd += ["--tasks", tasks]
             rc = run_logged(cmd, run_dir / "logs" / f"eval_round_{rnd:04d}_{stamp()}.log")
-            if rc == 0 and (out / "result.json").exists():
-                prune_after_eval(run_dir, run, rnd, ckpt)
-            elif not _stop["requested"]:
+            if rc != 0 and not _stop["requested"]:
                 failures += 1
                 print(f"!!  evaluation of round {rnd} failed (exit {rc})")
         finally:
@@ -552,13 +524,12 @@ def baseline(bench: str, s: Settings, device: str) -> int:
 # Commands
 # --------------------------------------------------------------------------------------------
 def selected_runs(args, s: Settings) -> list[RunSpec]:
-    modes = [args.mode] if getattr(args, "mode", None) else s.modes()
     if getattr(args, "phase", None):
         phases = [args.phase]
     else:
         # `run` and `plan` default to Phase 1; `eval` and `status` cover whatever exists.
         phases = [1, 2] if args.cmd in ("eval", "status") else [1]
-    runs = [spec for mode in modes for phase in phases for spec in grid.runs_for(mode, phase, s)]
+    runs = [spec for phase in phases for spec in grid.runs_for(phase, s)]
     if getattr(args, "only", None):
         runs = [r for r in runs if args.only in r.label()]
     return runs
@@ -690,14 +661,13 @@ def _size_gb(path: Path) -> float:
 
 
 def cmd_smoke_case(args, s: Settings) -> int:
-    mode, bench_key, arm = args.name.split("-")
+    bench_key, arm = args.name.split("-")
     bench, partition, only_task = SMOKE_BENCHES[bench_key]
     s = smoke_settings(s.study_root / "smoke" / bench_key)
     ensure_prepared(s, bench)
     _restrict_task_map(s, bench, only_task)
     federated = arm == "fed"
     spec = RunSpec(
-        mode,
         bench,
         "federated" if federated else "centralized",
         partition if federated else None,
@@ -756,7 +726,6 @@ def cmd_smoke_resume(args, s: Settings) -> int:
     for arm in ("federated", "centralized"):
         federated = arm == "federated"
         spec = RunSpec(
-            "lora",
             "libero_object",
             arm,
             "taskdisjoint" if federated else None,
@@ -859,9 +828,7 @@ def cmd_smoke_legacy(args, s: Settings) -> int:
 
 
 def cmd_smoke(args, s: Settings) -> int:
-    cases = [
-        ["smoke-case", f"{m}-{b}-{a}"] for m in args.modes for b in SMOKE_BENCHES for a in ("fed", "cen")
-    ]
+    cases = [["smoke-case", f"{b}-{a}"] for b in SMOKE_BENCHES for a in ("fed", "cen")]
     cases += [["smoke-resume"], ["smoke-legacy"]]
     if args.only:
         cases = [c for c in cases if args.only in " ".join(c)]
@@ -884,7 +851,7 @@ def cmd_smoke(args, s: Settings) -> int:
 # Throughput measurements
 # --------------------------------------------------------------------------------------------
 def cmd_bench_case(args, s: Settings) -> int:
-    mode, bench, workers = args.name.split("-")
+    bench, workers = args.name.split("-")
     root = s.study_root / "bench"
     s = smoke_settings(
         root,
@@ -895,7 +862,7 @@ def cmd_bench_case(args, s: Settings) -> int:
         NUM_WORKERS=workers.removeprefix("w"),
     )
     ensure_prepared(s, bench)
-    spec = RunSpec(mode, bench, "federated", "taskdisjoint", 1000, 1)
+    spec = RunSpec(bench, "federated", "taskdisjoint", 1000, 1)
     run_dir = root / "runs" / args.name
     shutil.rmtree(run_dir, ignore_errors=True)
     out = train_dir(run_dir)
@@ -907,7 +874,7 @@ def cmd_bench_case(args, s: Settings) -> int:
     steady = rows[-1] if len(rows) >= 2 else {}  # round 1 includes starting the data-loader workers
     result = {
         "case": args.name,
-        "mode": mode,
+        "mode": grid.MODE,
         "benchmark": bench,
         "workers_per_client": int(workers.removeprefix("w")),
         "batch_size": s.batch_size,
@@ -927,8 +894,7 @@ def cmd_bench_case(args, s: Settings) -> int:
 
 
 def cmd_bench_workers(args, s: Settings) -> int:
-    cases = [f"{m}-libero_object-w{w}" for m in args.modes for w in args.workers]
-    cases += [f"{m}-metaworld_mt10-w{args.workers[-1]}" for m in args.modes]
+    cases = [f"libero_object-w{w}" for w in args.workers] + [f"metaworld_mt10-w{args.workers[-1]}"]
     failed = []
     for case in cases:
         if _stop["requested"]:
@@ -982,7 +948,6 @@ def main() -> int:
         sub.add_parser(name).add_argument("--benchmarks", nargs="*")
     for name in ("plan", "run", "eval", "status"):
         p = sub.add_parser(name)
-        p.add_argument("--mode", choices=("lora", "full"), help="default: RUN_LORA / RUN_FULL")
         p.add_argument(
             "--phase", type=int, choices=(1, 2), help="1: task-disjoint (+ centralized); 2: IID + shared-core"
         )
@@ -998,13 +963,11 @@ def main() -> int:
     sub.add_parser("baseline").add_argument("--device")
     sub.add_parser("aggregate")
     p = sub.add_parser("smoke")
-    p.add_argument("--modes", nargs="*", default=["lora", "full"])
-    p.add_argument("--only", help="only cases containing this, e.g. 'lora-metaworld'")
+    p.add_argument("--only", help="only cases containing this, e.g. 'metaworld'")
     sub.add_parser("smoke-case").add_argument("name")
     sub.add_parser("smoke-resume")
     sub.add_parser("smoke-legacy")
     p = sub.add_parser("bench-workers")
-    p.add_argument("--modes", nargs="*", default=["lora", "full"])
     p.add_argument("--workers", nargs="*", type=int, default=[1, 2, 3, 4])
     sub.add_parser("bench-case").add_argument("name")
     p = sub.add_parser("bench-eval")

@@ -13,27 +13,21 @@
 # limitations under the License.
 """How the federated VLA study builds and fine-tunes the pretrained SmolVLA policy.
 
-Two modes, both starting from `lerobot/smolvla_base` (the whole pretrained policy, not the
-VLM-only initialization):
-
-- ``full``: backbone and action head (`train_expert_only=false`, `freeze_vision_encoder=false`):
-  0.393B trainable parameters. This is not SmolVLA's default recipe, which trains only the action
-  expert (99.9M), but matches "backbone and action head" and the 0.40B the study's reference
-  (DECENT-VLA) reports. SmolVLA's own code still freezes the parts of its VLM that the action expert
-  never reads (`lm_head`, the final norm and the last layer).
-- ``lora``: rank-64, alpha-128 LoRA on every attention and MLP projection of the vision encoder,
-  the language backbone and the action expert, plus the small state/action/time projections trained
-  at full rank (a rank-64 adapter on a 32-wide projection would be larger than the layer itself).
-  In the backbone's last layer only the key and value projections are adapted: the action expert
-  reads nothing else of that layer, so other adapters there would never get a gradient.
+The study fine-tunes `lerobot/smolvla_base` (the whole pretrained policy, not the VLM-only
+initialization) with LoRA: rank 64, alpha 128, on every attention and MLP projection of the vision
+encoder, the language backbone and the action expert, plus the small state/action/time projections
+trained at full rank (a rank-64 adapter on a 32-wide projection would be larger than the layer
+itself). In the backbone's last layer only the key and value projections are adapted: the action
+expert reads nothing else of that layer, so other adapters there would never get a gradient.
 
 The CLI flags returned here are used verbatim by both the federated and the centralized arm, and the
-trainable sets they produce are pinned by `tests/federated/test_vla_modes.py`.
+trainable set they produce is pinned by `tests/federated/test_vla_modes.py`.
 """
 
 POLICY = "smolvla"
 PRETRAINED = "lerobot/smolvla_base"
-MODES = ("lora", "full")
+# The fine-tuning mode; it appears in study and run names.
+MODE = "lora"
 
 LORA_RANK = 64
 LORA_ALPHA = 128
@@ -67,34 +61,24 @@ LORA_FULL_RANK_MODULES = [
 N_ACTION_STEPS = 10
 
 
-def policy_args(mode: str, device: str = "cuda", dtype: str = "float32") -> list[str]:
-    """`--policy.*` flags that build SmolVLA from its pretrained checkpoint for `mode`.
-
-    `dtype="null"` keeps SmolVLA's own bfloat16 weights, as in its published code.
-    """
-    if mode not in MODES:
-        raise ValueError(f"unknown mode {mode!r}; expected one of {MODES}")
+def policy_args(device: str = "cuda") -> list[str]:
+    """`--policy.*` flags that build SmolVLA from its pretrained checkpoint."""
     return [
         f"--policy.path={PRETRAINED}",
         # Features come from the dataset, not from smolvla_base's SO-100 camera layout.
         "--policy.input_features=null",
         "--policy.output_features=null",
-        # Both modes: LoRA adapters inside the VLM need it in train mode and on the graph.
+        # LoRA adapters inside the VLM need it in train mode (the base weights stay frozen under PEFT).
         "--policy.train_expert_only=false",
         "--policy.freeze_vision_encoder=false",
-        # Train float32 weights (compute runs in bf16 autocast): smolvla_base is stored in bfloat16,
-        # where an AdamW step of 1e-4 rounds to no change for about half of the weights.
-        f"--policy.dtype={dtype}",
         "--policy.push_to_hub=false",
         f"--policy.device={device}",
         f"--policy.n_action_steps={N_ACTION_STEPS}",
     ]
 
 
-def peft_args(mode: str) -> list[str]:
-    """`--peft.*` flags for `mode` (none for full fine-tuning)."""
-    if mode == "full":
-        return []
+def peft_args() -> list[str]:
+    """`--peft.*` flags of the study's LoRA."""
     return [
         "--peft.method_type=LORA",
         f"--peft.r={LORA_RANK}",

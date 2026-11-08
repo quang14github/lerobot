@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Each fine-tuning mode of the VLA study trains exactly the intended SmolVLA parameters.
+"""The VLA study's LoRA trains exactly the intended SmolVLA parameters.
 
 The policy is built on the meta device (no weights, no GPU) from the very CLI flags the study
 passes to the trainers, so these tests also cover how those flags parse.
@@ -38,8 +38,8 @@ from lerobot.federated.vla_study import LAST_BACKBONE_LAYER, LORA_FULL_RANK_MODU
 pytest.importorskip("peft")
 pytest.importorskip("transformers")
 
-# Exact trainable counts, kept here so any change to the definitions is a visible diff.
-EXPECTED = {"full": 392_904_096, "lora": 42_361_680}
+# The exact trainable count, kept here so any change to the definition is a visible diff.
+EXPECTED_TRAINABLE = 42_361_680
 # Adapted Linear layers: (vision encoder, language backbone, action expert). The backbone's last
 # layer only gets k/v adapters (2 of its 7 projections): 15 x 7 + 2 = 107.
 EXPECTED_ADAPTERS = (72, 107, 112)
@@ -50,15 +50,15 @@ def _parse(cfg: FederatedTrainPipelineConfig) -> FederatedTrainPipelineConfig:
     return cfg
 
 
-def build(mode: str, tmp_path: Path):
-    """The policy the trainers would build for `mode`, on the meta device."""
+def build(tmp_path: Path):
+    """The policy the trainers would build, on the meta device."""
     from lerobot.policies.factory import get_policy_class
 
     args = [
         "--dataset.repo_id=lerobot/libero",
         f"--output_dir={tmp_path / 'run'}",
-        *policy_args(mode, device="cpu"),
-        *peft_args(mode),
+        *policy_args(device="cpu"),
+        *peft_args(),
     ]
     try:
         with patch.object(sys, "argv", ["lerobot-fl-train", *args]):
@@ -88,28 +88,13 @@ def trainable(model) -> dict[str, int]:
     return {n: p.numel() for n, p in model.named_parameters() if p.requires_grad}
 
 
-@pytest.mark.parametrize("mode", list(EXPECTED))
-def test_trainable_parameter_count(mode, tmp_path):
-    _, model = build(mode, tmp_path)
-    assert sum(trainable(model).values()) == EXPECTED[mode]
-
-
-@pytest.mark.parametrize("mode", list(EXPECTED))
-def test_trainable_weights_are_float32(mode, tmp_path):
-    """smolvla_base is stored in bfloat16, where most 1e-4 AdamW steps would round to no change."""
-    _, model = build(mode, tmp_path)
-    assert {p.dtype for p in model.parameters() if p.requires_grad} == {torch.float32}
-
-
-def test_full_unfreezes_the_backbone(tmp_path):
-    _, model = build("full", tmp_path)
-    names = trainable(model)
-    for part in ("vision_model", "text_model", "lm_expert", "connector", "action_out_proj"):
-        assert any(part in n for n in names), part
+def test_trainable_parameter_count(tmp_path):
+    _, model = build(tmp_path)
+    assert sum(trainable(model).values()) == EXPECTED_TRAINABLE
 
 
 def test_lora_adapts_vision_backbone_and_action_head(tmp_path):
-    _, model = build("lora", tmp_path)
+    _, model = build(tmp_path)
     names = trainable(model)
     adapted = {n.rsplit(".lora_A", 1)[0] for n in names if ".lora_A." in n}
     components = Counter()

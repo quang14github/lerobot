@@ -165,8 +165,6 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self.config = config
         self.init_rtc_processor()
         self.model = VLAFlowMatching(config, rtc_processor=self.rtc_processor)
-        if config.dtype == "float32":
-            self.model.to(torch.float32)
         self.reset()
 
     def reset(self):

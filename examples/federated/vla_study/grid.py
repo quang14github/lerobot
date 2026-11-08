@@ -1,4 +1,4 @@
-"""The grid of the federated SmolVLA fine-tuning study, and the commands that train each run.
+"""The grid of the federated SmolVLA (LoRA) fine-tuning study, and the commands that train each run.
 
 Settings are environment variables, in the style of examples/federated/noniid.sh. The defaults
 reproduce the planned study:
@@ -6,18 +6,18 @@ reproduce the planned study:
   ROUNDS=200 LOCAL_STEPS=250 NUM_CLIENTS=5 BATCH_SIZE=64 SAVE_EVERY=20
   SEEDS="1000 2000 3000" PARTITION_SEEDS="1 2 3"     (paired: seed 1000 uses partition seed 1, ...)
   BENCHMARKS="libero_object libero_goal libero_spatial metaworld_mt10"
-  RUN_LORA=1 RUN_FULL=1 RUN_FEDERATED=1 RUN_CENTRALIZED=1          (switches)
+  RUN_FEDERATED=1 RUN_CENTRALIZED=1                                (switches)
   CLIENT_WEIGHTING=uniform CLIENT_OPT_STATE=reset NUM_WORKERS=3 CEN_NUM_WORKERS=12
-  DEVICE=cuda MIXED_PRECISION=bf16 PARAM_DTYPE=float32   (PARAM_DTYPE=null: SmolVLA's own bf16 weights)
+  DEVICE=cuda MIXED_PRECISION=bf16
   EVAL_EPISODES=10 EVAL_SEED=1000 EVAL_DEVICE=cuda
   STUDY_ROOT=outputs/fedvla TAG= WANDB_PROJECT=
 
 Run identity (no timestamps, so rerunning a command finds and continues the same run):
 
-  $STUDY_ROOT/studies/<bench>_smolvla_<mode>_<partition>_<K>c_r<R>_ls<L>_bs<B>_<weighting>[_TAG]/
-      fed-<mode>-<partition>-s<seed>-p<partition seed>/
-  $STUDY_ROOT/studies/<bench>_smolvla_<mode>_pooled_r<R>x<L>x<K>_bs<B>[_TAG]/
-      cen-<mode>-s<seed>/          (one per seed: the reference for every partition)
+  $STUDY_ROOT/studies/<bench>_smolvla_lora_<partition>_<K>c_r<R>_ls<L>_bs<B>_<weighting>[_TAG]/
+      fed-lora-<partition>-s<seed>-p<partition seed>/
+  $STUDY_ROOT/studies/<bench>_smolvla_lora_pooled_r<R>x<L>x<K>_bs<B>[_TAG]/
+      cen-lora-s<seed>/          (one per seed: the reference for every partition)
   $STUDY_ROOT/baselines/<bench>_smolvla/   (the untrained pretrained model, evaluated once)
 """
 
@@ -33,6 +33,7 @@ from lerobot.federated import vla_study  # noqa: E402
 from lerobot.federated.tasks import BENCHMARKS, BenchmarkSpec  # noqa: E402
 
 POLICY = vla_study.POLICY
+MODE = vla_study.MODE
 
 # Partition name -> (partition.strategy, extra flags).
 PARTITIONS = {
@@ -45,10 +46,10 @@ PHASE_PARTITIONS = {1: ("taskdisjoint",), 2: ("iid", "sharedcore")}
 WEIGHTING_SHORT = {"uniform": "uni", "frames": "frm", "episodes": "epi"}
 
 # Optimizer steps per second at batch 64, used only for time estimates (throughput.py) until
-# `study.py bench-workers` measures them. SmolVLA with only its action expert trainable ran at
-# 1.9 (LIBERO) / 2.4 (Meta-World) steps/s on an A100 80GB; LoRA and full backpropagate through the
-# whole VLM, hence the lower guesses.
-DEFAULT_SPS = {"lora": 1.2, "full": 1.0}
+# `study.py bench-workers` measures it. SmolVLA with only its action expert trainable ran at
+# 1.9 (LIBERO) / 2.4 (Meta-World) steps/s on an A100 80GB; LoRA backpropagates through the whole
+# VLM, hence the lower guess.
+DEFAULT_SPS = 1.2
 
 
 def _env(name: str, default: str) -> str:
@@ -74,8 +75,6 @@ class Settings:
     seeds: tuple[int, ...]
     partition_seeds: tuple[int, ...]
     benchmarks: tuple[str, ...]
-    run_lora: bool
-    run_full: bool
     run_federated: bool
     run_centralized: bool
     client_weighting: str
@@ -83,7 +82,6 @@ class Settings:
     num_workers: int
     cen_num_workers: int
     device: str
-    param_dtype: str
     mixed_precision: str
     eval_episodes: int
     eval_seed: int
@@ -105,8 +103,6 @@ class Settings:
             seeds=_ints("SEEDS", "1000 2000 3000"),
             partition_seeds=_ints("PARTITION_SEEDS", "1 2 3"),
             benchmarks=tuple(_env("BENCHMARKS", " ".join(BENCHMARKS)).split()),
-            run_lora=_flag("RUN_LORA"),
-            run_full=_flag("RUN_FULL"),
             run_federated=_flag("RUN_FEDERATED"),
             run_centralized=_flag("RUN_CENTRALIZED"),
             client_weighting=_env("CLIENT_WEIGHTING", "uniform"),
@@ -114,7 +110,6 @@ class Settings:
             num_workers=int(_env("NUM_WORKERS", "3")),
             cen_num_workers=int(_env("CEN_NUM_WORKERS", "12")),
             device=_env("DEVICE", "cuda"),
-            param_dtype=_env("PARAM_DTYPE", "float32"),
             mixed_precision=_env("MIXED_PRECISION", "bf16"),
             eval_episodes=int(_env("EVAL_EPISODES", "10")),
             eval_seed=int(_env("EVAL_SEED", "1000")),
@@ -142,9 +137,6 @@ class Settings:
                 "ROUNDS must be a multiple of SAVE_EVERY so the final round is on the checkpoint grid"
             )
 
-    def modes(self) -> list[str]:
-        return [m for m, on in (("lora", self.run_lora), ("full", self.run_full)) if on]
-
     def as_env(self) -> dict[str, str]:
         out = {}
         for key, value in asdict(self).items():
@@ -154,9 +146,8 @@ class Settings:
 
 @dataclass(frozen=True)
 class RunSpec:
-    """One training run: a (mode, benchmark, arm, partition, seed) cell of the grid."""
+    """One training run: a (benchmark, arm, partition, seed) cell of the grid."""
 
-    mode: str
     bench: str
     arm: str  # federated | centralized
     partition: str | None
@@ -166,6 +157,10 @@ class RunSpec:
     @property
     def policy(self) -> str:
         return POLICY
+
+    @property
+    def mode(self) -> str:
+        return MODE
 
     @property
     def benchmark(self) -> BenchmarkSpec:
@@ -206,7 +201,7 @@ class RunSpec:
         return f"{self.mode}/{self.bench}/{self.run_id()}"
 
     def to_json(self) -> dict:
-        return asdict(self)
+        return {**asdict(self), "policy": POLICY, "mode": MODE}
 
 
 def baseline_dir(s: Settings, bench: str) -> Path:
@@ -228,17 +223,17 @@ def benchmark_episodes(s: Settings, bench: str) -> list[int]:
     return sorted(int(ep) for ep in json.loads(path.read_text())["episode_tasks"])
 
 
-def runs_for(mode: str, phase: int, s: Settings) -> list[RunSpec]:
-    """Runs of one mode and phase, in the order that finishes complete comparisons first:
+def runs_for(phase: int, s: Settings) -> list[RunSpec]:
+    """Runs of one phase, in the order that finishes complete comparisons first:
     for each seed, for each benchmark, the federated run(s), then the centralized reference."""
     runs = []
     for seed, partition_seed in zip(s.seeds, s.partition_seeds, strict=True):
         for bench in s.benchmarks:
             if s.run_federated:
                 for partition in PHASE_PARTITIONS[phase]:
-                    runs.append(RunSpec(mode, bench, "federated", partition, seed, partition_seed))
+                    runs.append(RunSpec(bench, "federated", partition, seed, partition_seed))
             if s.run_centralized and phase == 1:
-                runs.append(RunSpec(mode, bench, "centralized", None, seed, None))
+                runs.append(RunSpec(bench, "centralized", None, seed, None))
     return runs
 
 
@@ -295,8 +290,8 @@ def federated_command(
         f"--accelerator.mixed_precision={s.mixed_precision}",
         f"--output_dir={output_dir}",
         f"--job_name={spec.study_id(s)}-{spec.run_id()}",
-        *vla_study.policy_args(spec.mode, device=s.device, dtype=s.param_dtype),
-        *vla_study.peft_args(spec.mode),
+        *vla_study.policy_args(device=s.device),
+        *vla_study.peft_args(),
         *vla_study.scheduler_args(s.rounds, s.local_steps, s.num_clients, "federated"),
         *_wandb_args(s),
     ]
@@ -328,8 +323,8 @@ def centralized_command(
         "--prune_checkpoints=true",
         "--env_eval_freq=0",
         "--log_freq=250",
-        *vla_study.policy_args(spec.mode, device=s.device, dtype=s.param_dtype),
-        *vla_study.peft_args(spec.mode),
+        *vla_study.policy_args(device=s.device),
+        *vla_study.peft_args(),
         *vla_study.scheduler_args(s.rounds, s.local_steps, s.num_clients, "centralized"),
         *_wandb_args(s),
     ]
@@ -339,10 +334,10 @@ def centralized_command(
 def baseline_command(bench: str, s: Settings, output_dir: Path, device: str) -> list[str]:
     """Build the untrained model (pretrained weights + this benchmark's normalization) as round 0.
 
-    Built in LoRA mode: its zero-initialized adapters leave the pretrained model unchanged, and the
-    checkpoint holds only the adapters, so no copy of the base model is written.
+    The LoRA adapters start at zero, so the model is the pretrained one, and the checkpoint holds
+    only the adapters: no copy of the base model is written.
     """
-    spec = RunSpec("lora", bench, "federated", "iid", s.seeds[0], s.partition_seeds[0])
+    spec = RunSpec(bench, "federated", "iid", s.seeds[0], s.partition_seeds[0])
     return federated_command(
         spec,
         s,

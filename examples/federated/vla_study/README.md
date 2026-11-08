@@ -1,6 +1,6 @@
-# Federated fine-tuning of SmolVLA
+# Federated LoRA fine-tuning of SmolVLA
 
-This study fine-tunes the pretrained SmolVLA (`lerobot/smolvla_base`) in two modes, LoRA and full.
+This study fine-tunes the pretrained SmolVLA (`lerobot/smolvla_base`) with LoRA (rank 64, alpha 128).
 - **Arms:** federated (5 clients, FedAvg, equal client weights) against a centralized reference
   with the same total compute.
 - **Benchmarks:** LIBERO-Object, LIBERO-Goal and LIBERO-Spatial (task ids 0-9), and Meta-World MT10.
@@ -34,13 +34,11 @@ are the planned study:
 | `SAVE_EVERY` | 20 | checkpoint (and evaluation) interval in rounds |
 | `SEEDS`, `PARTITION_SEEDS` | `1000 2000 3000`, `1 2 3` | paired one to one |
 | `BENCHMARKS` | all four | `libero_object libero_goal libero_spatial metaworld_mt10` |
-| `RUN_LORA`, `RUN_FULL` | 1, 1 | which modes `run` / `eval` / `status` cover |
 | `RUN_FEDERATED`, `RUN_CENTRALIZED` | 1, 1 | which arms |
 | `NUM_WORKERS` | 3 | data-loader workers per client (5 clients: 15 processes) |
 | `CEN_NUM_WORKERS` | 12 | data-loader workers of the centralized arm |
 | `CLIENT_WEIGHTING`, `CLIENT_OPT_STATE` | `uniform`, `reset` | |
 | `DEVICE`, `EVAL_DEVICE` | `cuda`, `cuda` | `EVAL_DEVICE=cpu` evaluates on the CPU |
-| `PARAM_DTYPE` | `float32` | parameter dtype (compute is bf16 autocast); `null` keeps SmolVLA's own bf16 weights |
 | `EVAL_EPISODES`, `EVAL_SEED` | 10, 1000 | per task, for every evaluation |
 | `TAG`, `WANDB_PROJECT` | empty | a note in study names; stream to Weights & Biases |
 
@@ -60,13 +58,13 @@ It writes `$STUDY_ROOT/prep/<benchmark>/tasks.tsv` and `partition_checks.json`.
 
 ```bash
 python $S/study.py smoke                       # all cases
-python $S/study.py smoke --only lora-metaworld # a subset
+python $S/study.py smoke --only metaworld      # a subset
 ```
 
 The suite runs these cases:
 
-- **Main cases:** LoRA and full, federated and centralized, on LIBERO-Object and on one Meta-World
-  task (`reach-v3`). Each case trains 2 rounds of 3 local steps (or 30 centralized steps), then
+- **Main cases:** federated and centralized, on LIBERO-Object and on one Meta-World task
+  (`reach-v3`). Each case trains 2 rounds of 3 local steps (or 30 centralized steps), then
   evaluates the final checkpoint on one episode.
 - **`smoke-resume`:** interrupts a federated and a centralized run with Ctrl-C (SIGINT) partway,
   restarts them, and checks that they continue from the saved round and finish. A run refuses to
@@ -86,7 +84,7 @@ python $S/throughput.py > throughput.md
 ```
 
 `throughput.md` reports:
-- steps/s, GPU peak memory and RAM for each mode and worker count;
+- steps/s, GPU peak memory and RAM for each worker count;
 - disk per checkpoint;
 - evaluation episodes/hour on GPU and CPU;
 - the planned grid in GPU-hours, with options to reduce `ROUNDS` or `LOCAL_STEPS`.
@@ -96,9 +94,7 @@ Use it to set `NUM_WORKERS`, and to decide whether evaluation should run on the 
 ## 4. Phase 1: task-disjoint partition
 
 ```bash
-python $S/study.py run --mode lora              # all LoRA runs, then:
-python $S/study.py run --mode full
-# or both modes in one command (LoRA first): python $S/study.py run
+python $S/study.py run
 ```
 
 - **Order:** `run` first evaluates the untrained model on each benchmark. It then trains the runs
@@ -107,8 +103,7 @@ python $S/study.py run --mode full
   finish early.
 - **Evaluation:** each run is evaluated once its training completes: rounds 20, 40, ..., 200 on
   all 10 tasks, 10 episodes each, with the same initial states for every arm.
-- **Previewing the order:** `python $S/study.py plan --mode lora` lists the runs without running
-  them.
+- **Previewing the order:** `python $S/study.py plan` lists the runs without running them.
 
 **Stopping and continuing.**
 - **Stopping:** press Ctrl-C. The current run finishes its training step, saves, and the command
@@ -159,8 +154,7 @@ whole curve is kept.
 ## 5. Phase 2: IID and shared-core partitions
 
 ```bash
-python $S/study.py run --mode lora --phase 2
-python $S/study.py run --mode full --phase 2
+python $S/study.py run --phase 2
 ```
 
 Phase 2 is federated only: the centralized runs of Phase 1 are the reference for every partition.
@@ -170,10 +164,7 @@ Phase 2 is federated only: the centralized runs of Phase 1 are the reference for
 
 ## Disk
 
-| Run | Per checkpoint | Kept |
-|---|---|---|
-| LoRA | ~0.17 GB (adapters + full-rank layers) | all 10 checkpoints, plus the federated state (~0.17 GB) |
-| full | ~1.8 GB | the final checkpoint and the run state (federated ~1.6 GB; centralized: the latest checkpoint with its optimizer state, ~5 GB). Other checkpoints are kept only until they are evaluated |
-
-With `run --no-eval`, a full-mode run keeps all 10 checkpoints (~18 GB) until `eval` has
-evaluated them.
+Each checkpoint holds the adapters and the full-rank layers, about 0.16 GB. A centralized
+checkpoint also carries its optimizer state, about 0.48 GB, but only the newest one keeps it. All
+10 checkpoints of a run are kept, plus the federated run state (~0.16 GB). A run therefore needs
+about 2 GB, and the 48 runs of both phases need about 100 GB.
